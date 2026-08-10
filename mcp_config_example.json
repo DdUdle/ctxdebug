@@ -1,0 +1,69 @@
+{
+  "mcpServers": {
+    "windbg": {
+      "command": "python",
+      "args": [
+        "C:\\path\\to\\mco\\windbg_mcp.py"
+      ],
+      "env": {
+        "WINDBG_MCP_CDB": "C:\\Program Files (x86)\\Windows Kits\\10\\Debuggers\\x64\\cdb.exe"
+      },
+      "description": "WinDbg/cdb.exe — crash dumps, kernel, heap, shadow stack. 70+ tools."
+    },
+    "ida": {
+      "command": "python",
+      "args": [
+        "C:\\path\\to\\mco\\ida_mcp.py"
+      ],
+      "env": {
+        "IDA_MCP_HOST": "localhost",
+        "IDA_MCP_PORT": "2022",
+        "IDA_PATH": "C:\\Program Files\\IDA Professional 9.x"
+      },
+      "description": "IDA Pro 9.x — static analysis, decompile, xrefs, rename, type recovery. 32+ tools."
+    },
+    "x64dbg": {
+      "command": "python",
+      "args": [
+        "-m",
+        "agent",
+        "--mcp"
+      ],
+      "cwd": "C:\\path\\to\\mco",
+      "env": {
+        "X64DBG_PATH": "C:\\path\\to\\x64dbg\\x64dbg.exe"
+      },
+      "description": "x64dbg — dynamic analysis, bossix, memory patches, pattern search. 35+ tools."
+    },
+    "mco-sessions": {
+      "command": "python",
+      "args": [
+        "C:\\path\\to\\mco\\mco_sessions.py"
+      ],
+      "env": {
+        "MCO_SESSIONS_DB": "C:\\path\\to\\mco\\sessions.db"
+      },
+      "description": "MCO Session Intelligence — record, search, replay, export debug sessions. 13 tools."
+    },
+    "mco": {
+      "command": "python",
+      "args": [
+        "C:\\path\\to\\mco\\mco_orchestrator.py"
+      ],
+      "env": {
+        "CDB_PATH": "C:\\Program Files (x86)\\Windows Kits\\10\\Debuggers\\x64\\cdb.exe",
+        "IDA_HOST": "localhost",
+        "IDA_PORT": "2022",
+        "X64DBG_PIPE": "\\\\.\\pipe\\x64dbg_ai_agent"
+      },
+      "description": "MCO Orchestrator — cross-debugger meta-tools: crash-to-source, pivot_to_ida, malware_audit, heap_spray, binary_diff. 7 compound tools."
+    },
+    "mco-gateway": {
+      "command": "python",
+      "args": [
+        "C:\\path\\to\\mco\\mco_gateway.py"
+      ],
+      "description": "MCO Unified Gateway — all servers through one stdio connection."
+    }
+  }
+}

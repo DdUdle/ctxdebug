@@ -1,0 +1,44 @@
+[project]
+name = "ctxdebug"
+version = "0.1.0"
+description = "AI-powered x64 debugger agent with ReAct reasoning, and modular skills"
+authors = [
+    { name = "DdUdle", email = "info@ctxdebug.xyz" }
+]
+urls = { Homepage = "https://ctxdebug.xyz", Repository = "https://github.com/DdUdle/ctxdebug" }
+keywords = ["mcp", "debugger", "reverse-engineering", "ida", "windbg", "claude", "x64dbg"]
+classifiers = [
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12"
+]
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "aiohttp>=3.9.0",
+]
+
+[project.optional-dependencies]
+claude = ["anthropic>=0.40.0"]
+dev = ["pytest", "pytest-asyncio"]
+
+[project.scripts]
+x64-agent = "agent.__main__:main"
+
+[tool.setuptools]
+py-modules = [
+    "windbg_mcp",
+    "ida_mcp",
+    "ida_server_plugin",
+    "mco_orchestrator",
+    "mco_sessions",
+    "mco_gateway",
+]
+
+[tool.setuptools.packages.find]
+include = ["agent*"]
+namespaces = false
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
