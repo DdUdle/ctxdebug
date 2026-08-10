@@ -3,7 +3,7 @@
 MCP server platform that connects WinDbg, IDA Pro 9.x, and x64dbg to Claude AI for AI-assisted reverse engineering and Windows security research.
 
 **Owner:** Windows security researcher (heap exploitation, anti-debug).
-**Language policy:** Code and docs in English; user communicates in Russian (informal).
+**Language policy:** Code and docs in English only.
 
 ---
 
