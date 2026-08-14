@@ -15,7 +15,9 @@ classifiers = [
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
-    "aiohttp>=3.9.0",
+    # 3.10.11 is the first release without the known 3.9.x advisories
+    # (CVE-2024-23334, CVE-2024-30251, CVE-2024-52304).
+    "aiohttp>=3.10.11",
 ]
 
 [project.optional-dependencies]

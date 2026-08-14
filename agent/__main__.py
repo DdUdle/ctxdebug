@@ -34,7 +34,9 @@ def parse_args():
     parser.add_argument("--llm", choices=["claude", "local", "groq", "openrouter", "together", "lmstudio", "openai-compat", "none"],
                        default="none",
                        help="LLM backend: claude, local (Ollama), groq (FREE), openrouter (free models), together, lmstudio, openai-compat, none (heuristics only)")
-    parser.add_argument("--api-key", default=None, help="API key for LLM backend")
+    parser.add_argument("--api-key", default=None,
+                        help="API key for LLM backend (prefer the provider env var — "
+                             "command-line arguments are visible to other local processes)")
     parser.add_argument("--llm-model", default=None, help="LLM model name")
     parser.add_argument("--llm-endpoint", default=None, help="LLM endpoint URL")
     parser.add_argument("--memory-path", default=None, help="Path for persistent memory storage")

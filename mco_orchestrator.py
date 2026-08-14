@@ -157,6 +157,7 @@ class X64DbgClient:
 
     PIPE_NAME = os.environ.get("X64DBG_PIPE", r"\\.\pipe\x64dbg_ai_agent")
     MAGIC = b"X64A"
+    MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 
     def available(self) -> bool:
         return os.path.exists(self.PIPE_NAME)
@@ -173,6 +174,8 @@ class X64DbgClient:
                 if len(resp_header) < 16:
                     return {"error": "Incomplete response header"}
                 resp_len = struct.unpack("<I", resp_header[4:8])[0]
+                if resp_len > self.MAX_RESPONSE_BYTES:
+                    return {"error": f"Response too large: {resp_len} bytes"}
                 resp_data = pipe.read(resp_len)
                 return json.loads(resp_data.decode())
         except Exception as e:
@@ -522,6 +525,14 @@ print(json.dumps(summary))
         Compare two functions in IDA (useful for patch diffing).
         Shows added/removed/changed instructions.
         """
+        try:
+            addr_a_int = int(addr_a, 16)
+            addr_b_int = int(addr_b, 16)
+        except (TypeError, ValueError):
+            return {"error": f"Invalid address: {addr_a!r} / {addr_b!r}"}
+        addr_a_repr = json.dumps(str(addr_a))
+        addr_b_repr = json.dumps(str(addr_b))
+
         if not self.ida.available:
             return {"error": "IDA not available"}
 
@@ -542,8 +553,8 @@ def get_func_insns(addr):
         }})
     return insns
 
-a_insns = get_func_insns({int(addr_a, 16)})
-b_insns = get_func_insns({int(addr_b, 16)})
+a_insns = get_func_insns({addr_a_int})
+b_insns = get_func_insns({addr_b_int})
 
 # Simple diff: compare mnemonics sequence
 a_mnems = [i['mnem'] for i in a_insns]
@@ -551,8 +562,8 @@ b_mnems = [i['mnem'] for i in b_insns]
 common = set(a_mnems) & set(b_mnems)
 
 result = {{
-    'function_a': {{'address': '{addr_a}', 'instruction_count': len(a_insns), 'name': idc.get_func_name({int(addr_a, 16)})}},
-    'function_b': {{'address': '{addr_b}', 'instruction_count': len(b_insns), 'name': idc.get_func_name({int(addr_b, 16)})}},
+    'function_a': {{'address': {addr_a_repr}, 'instruction_count': len(a_insns), 'name': idc.get_func_name({addr_a_int})}},
+    'function_b': {{'address': {addr_b_repr}, 'instruction_count': len(b_insns), 'name': idc.get_func_name({addr_b_int})}},
     'similarity_pct': round(len(common) / max(len(a_mnems), len(b_mnems), 1) * 100, 1),
     'size_delta': len(b_insns) - len(a_insns),
     'a_instructions': a_insns[:50],
