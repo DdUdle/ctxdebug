@@ -2,7 +2,7 @@
 Execution Control Skills — run, step, pause, trace.
 """
 
-from . import SkillDefinition, SkillResult, SkillRegistry
+from . import SkillDefinition, SkillResult, SkillRegistry, parse_address, parse_int
 
 
 async def skill_run(bridge, context, args):
@@ -58,9 +58,7 @@ async def skill_step_over(bridge, context, args):
 
 async def skill_step_n(bridge, context, args):
     """Step N times and report final state."""
-    count = args.get("count", 10)
-    if isinstance(count, str):
-        count = int(count)
+    count = parse_int(args.get("count", 10), 10)
     step_type = args.get("type", "over")  # "into" or "over"
     step_fn = bridge.step_into if step_type == "into" else bridge.step_over
 
@@ -117,8 +115,7 @@ async def skill_run_to(bridge, context, args):
     if address is None:
         return SkillResult(success=False, summary="Missing 'address' argument")
 
-    if isinstance(address, str):
-        address = int(address, 16) if address.startswith("0x") else int(address)
+    address = parse_address(address)
 
     # Set temporary breakpoint
     await bridge.set_breakpoint(address, bp_type="software")
@@ -184,11 +181,7 @@ async def skill_set_register(bridge, context, args):
             error_hint="Example: {\"register\": \"rax\", \"value\": \"0x0\"}",
         )
 
-    if isinstance(value, str):
-        if value.startswith("0x") or value.startswith("0X"):
-            value = int(value, 16)
-        else:
-            value = int(value)
+    value = parse_int(value)
 
     cmd = f"{register}={value:#x}"
     result = await bridge.execute_command(cmd)

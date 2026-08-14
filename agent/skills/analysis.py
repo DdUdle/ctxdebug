@@ -5,7 +5,7 @@ These skills do more than just call APIs — they POST-PROCESS results
 to give the agent meaningful, actionable intelligence.
 """
 
-from . import SkillDefinition, SkillResult, SkillRegistry
+from . import SkillDefinition, SkillResult, SkillRegistry, parse_address, parse_int
 
 
 async def skill_disassemble(bridge, context, args):
@@ -15,10 +15,8 @@ async def skill_disassemble(bridge, context, args):
 
     if not address:
         return SkillResult(success=False, summary="No address specified and current RIP is unknown")
-    if isinstance(address, str):
-        address = int(address, 16) if address.startswith("0x") else int(address)
-    if isinstance(count, str):
-        count = int(count)
+    address = parse_address(address)
+    count = parse_int(count, 30)
 
     instructions = await bridge.disassemble(address, count)
     if not instructions:
@@ -67,8 +65,7 @@ async def skill_analyze_function(bridge, context, args):
     address = args.get("address") or context.current_rip
     if not address:
         return SkillResult(success=False, summary="No address specified and current RIP is unknown")
-    if isinstance(address, str):
-        address = int(address, 16) if address.startswith("0x") else int(address)
+    address = parse_address(address)
 
     # Get function analysis from x64dbg
     func_info = await bridge.analyze_function(address)
@@ -154,8 +151,7 @@ async def skill_get_xrefs(bridge, context, args):
     address = args.get("address")
     direction = args.get("direction", "to")  # "to" or "from"
 
-    if isinstance(address, str):
-        address = int(address, 16) if address.startswith("0x") else int(address)
+    address = parse_address(address)
 
     if direction == "to":
         xrefs = await bridge.get_xrefs_to(address)

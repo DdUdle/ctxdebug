@@ -2,7 +2,7 @@
 Breakpoint Skills — software, hardware, memory, conditional breakpoints.
 """
 
-from . import SkillDefinition, SkillResult, SkillRegistry
+from . import SkillDefinition, SkillResult, SkillRegistry, parse_address
 
 
 async def skill_set_breakpoint(bridge, context, args):
@@ -20,8 +20,7 @@ async def skill_set_breakpoint(bridge, context, args):
     if address is None:
         return SkillResult(success=False, summary="Missing 'address' or 'api' argument")
 
-    if isinstance(address, str):
-        address = int(address, 16) if address.startswith("0x") else int(address)
+    address = parse_address(address)
 
     result = await bridge.set_breakpoint(address)
     success = "error" not in result
@@ -47,8 +46,7 @@ async def skill_set_hardware_breakpoint(bridge, context, args):
     if address is None:
         return SkillResult(success=False, summary="Missing 'address' argument")
 
-    if isinstance(address, str):
-        address = int(address, 16) if address.startswith("0x") else int(address)
+    address = parse_address(address)
 
     result = await bridge.set_hardware_breakpoint(address, size, condition)
     success = "error" not in result
@@ -76,8 +74,7 @@ async def skill_set_memory_breakpoint(bridge, context, args):
     if address is None:
         return SkillResult(success=False, summary="Missing 'address' argument")
 
-    if isinstance(address, str):
-        address = int(address, 16) if address.startswith("0x") else int(address)
+    address = parse_address(address)
 
     # Use x64dbg command for memory breakpoints
     cmd = f"bpm {address:X}, 0, {'w' if access_type == 'write' else 'r' if access_type == 'read' else 'rw'}"
@@ -97,8 +94,7 @@ async def skill_delete_breakpoint(bridge, context, args):
     if address is None:
         return SkillResult(success=False, summary="Missing 'address' argument")
 
-    if isinstance(address, str):
-        address = int(address, 16) if address.startswith("0x") else int(address)
+    address = parse_address(address)
 
     result = await bridge.delete_breakpoint(address)
     success = "error" not in result
@@ -121,8 +117,7 @@ async def skill_set_conditional_breakpoint(bridge, context, args):
     if address is None:
         return SkillResult(success=False, summary="Missing 'address' argument")
 
-    if isinstance(address, str):
-        address = int(address, 16) if address.startswith("0x") else int(address)
+    address = parse_address(address)
 
     # First set the breakpoint
     await bridge.set_breakpoint(address)

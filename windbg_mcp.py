@@ -36,6 +36,8 @@ import uuid
 from queue import Empty, Queue
 from typing import Any, Callable
 
+from mco_common import kv_block as _kv_block, section as _section
+
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "windbg"
 SERVER_VERSION = "1.0.0"
@@ -395,13 +397,6 @@ def _strip_prompt_prefix(line: str) -> str:
     return CDB_PROMPT_PREFIX_RE.sub("", line).strip()
 
 
-def _section(title: str, body: str) -> str:
-    body = body.strip("\n")
-    if not body:
-        body = "(empty)"
-    return f"### {title}\n{body}"
-
-
 def _filter_output(
     text: str,
     filter_pattern: str | None = None,
@@ -688,13 +683,6 @@ def _read_ssp() -> tuple[str, int | None]:
         return raw, _parse_cdb_int(m.group(1))
     except ValueError:
         return raw, None
-
-
-def _kv_block(pairs: list[tuple[str, str]]) -> str:
-    if not pairs:
-        return "(none)"
-    width = max(len(k) for k, _ in pairs)
-    return "\n".join(f"{k.ljust(width)} = {v}" for k, v in pairs)
 
 
 _DISASM_LINE_RE = re.compile(r"^[0-9a-fA-F`]{8,}\s+[0-9a-fA-F]{2,}\s+[a-z]{2,}")

@@ -36,6 +36,23 @@ def parse_address(value: Union[str, int, None], fallback: int = 0) -> int:
         return fallback
 
 
+def parse_int(value: Union[str, int, None], fallback: int = 0) -> int:
+    """Parse an int argument that may be a decimal or ``0x``-prefixed hex string."""
+    if value is None:
+        return fallback
+    if isinstance(value, int):
+        return value
+    value = value.strip()
+    if not value:
+        return fallback
+    try:
+        if value.startswith("0x") or value.startswith("0X"):
+            return int(value, 16)
+        return int(value)
+    except ValueError:
+        return fallback
+
+
 @dataclass
 class SkillResult:
     """Result of a skill execution."""

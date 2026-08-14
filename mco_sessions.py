@@ -15,11 +15,12 @@ import json
 import os
 import re
 import sqlite3
-import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any
+
+from mco_common import serve_stdio, text_error, text_result
 
 DB_PATH = os.environ.get(
     "MCO_SESSIONS_DB",
@@ -703,11 +704,10 @@ class MCPServer:
         self.mgr = SessionManager()
 
     def _ok(self, data: Any) -> dict:
-        text = data if isinstance(data, str) else json.dumps(data, indent=2)
-        return {"content": [{"type": "text", "text": text}], "isError": False}
+        return text_result(data)
 
     def _err(self, msg: str) -> dict:
-        return {"content": [{"type": "text", "text": f"ERROR: {msg}"}], "isError": True}
+        return text_error(msg)
 
     def handle(self, request: dict) -> dict | None:
         method = request.get("method")
@@ -784,17 +784,7 @@ class MCPServer:
 
 def main():
     server = MCPServer()
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            request = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        response = server.handle(request)
-        if response is not None:
-            print(json.dumps(response), flush=True)
+    serve_stdio(server.handle)
 
 
 if __name__ == "__main__":

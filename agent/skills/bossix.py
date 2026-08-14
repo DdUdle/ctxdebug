@@ -9,7 +9,7 @@ Instead of just calling "hide debugger", the agent:
 4. Can auto-patch common checks
 """
 
-from . import SkillDefinition, SkillResult, SkillRegistry
+from . import SkillDefinition, SkillResult, SkillRegistry, parse_address
 
 
 # Common bossix techniques and their signatures
@@ -222,8 +222,7 @@ async def skill_patch_bossix(bridge, context, args):
     if address is None:
         return SkillResult(success=False, summary="Missing 'address' argument")
 
-    if isinstance(address, str):
-        address = int(address, 16) if address.startswith("0x") else int(address)
+    address = parse_address(address)
 
     # Get instruction at address to determine patch
     disasm = await bridge.disassemble(address, 5)
