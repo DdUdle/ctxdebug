@@ -20,6 +20,14 @@ from enum import IntEnum
 from typing import Any, Callable, Optional
 
 
+def _default_socket_path() -> str:
+    """Per-user path for the dev/test Unix socket."""
+    runtime_dir = os.environ.get('XDG_RUNTIME_DIR')
+    base = runtime_dir if runtime_dir and os.path.isdir(runtime_dir) else os.path.expanduser('~/.x64ai')
+    os.makedirs(base, mode=0o700, exist_ok=True)
+    return os.path.join(base, 'x64dbg_ai_agent.sock')
+
+
 class ConnectionState(IntEnum):
     DISCONNECTED = 0
     CONNECTING = 1
@@ -42,6 +50,7 @@ class BridgeProtocol(IntEnum):
 
 PIPE_MAGIC = b'X64A'
 PIPE_VERSION = 1
+MAX_PAYLOAD_BYTES = 64 * 1024 * 1024
 
 class MsgType(IntEnum):
     COMMAND = 0x01
@@ -80,6 +89,8 @@ class PipeMessage:
         )
         if magic != PIPE_MAGIC:
             raise ValueError(f"Invalid magic: {magic}")
+        if payload_len > MAX_PAYLOAD_BYTES:
+            raise ValueError(f"Payload too large: {payload_len} bytes")
         payload_bytes = data[cls.HEADER_SIZE:cls.HEADER_SIZE + payload_len]
         payload = json.loads(payload_bytes) if payload_bytes else {}
         return cls(msg_type=MsgType(msg_type), seq_id=seq_id, payload=payload)
@@ -200,8 +211,9 @@ class X64DbgBridge:
                 self._pipe_reader = reader
                 self._pipe_writer = writer
             else:
-                # Unix socket fallback for development/testing
-                sock_path = self.pipe_name if self.pipe_name.startswith('/') else '/tmp/x64dbg_ai_agent.sock'
+                # Unix socket fallback for development/testing. Keep the socket
+                # out of the world-writable temp dir so it cannot be squatted.
+                sock_path = self.pipe_name if self.pipe_name.startswith('/') else _default_socket_path()
                 try:
                     reader, writer = await asyncio.open_unix_connection(sock_path)
                     self._pipe_reader = reader
@@ -415,6 +427,8 @@ class X64DbgBridge:
             while self.connected:
                 header = await self._pipe_reader.readexactly(PipeMessage.HEADER_SIZE)
                 _, _, _, payload_len, _ = struct.unpack('<4sHHII', header)
+                if payload_len > MAX_PAYLOAD_BYTES:
+                    raise ValueError(f"Payload too large: {payload_len} bytes")
                 payload = await self._pipe_reader.readexactly(payload_len)
                 data = header + payload
 

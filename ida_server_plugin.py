@@ -13,18 +13,32 @@ IDA Pro HTTP Server Plugin — запустить внутри IDA.
 После запуска MCO подключится автоматически к http://localhost:2022
 """
 
+import hmac
 import http.server
 import io
+import ipaddress
 import json
+import os
 import sys
 import threading
 import traceback
 
-_IDA_SERVER_PORT = int(__import__('os').environ.get('IDA_SERVER_PORT', '2022'))
-_IDA_SERVER_HOST = __import__('os').environ.get('IDA_SERVER_HOST', '127.0.0.1')
-_IDA_SERVER_TOKEN = __import__('os').environ.get('IDA_MCP_TOKEN', '')
+_IDA_SERVER_PORT = int(os.environ.get('IDA_SERVER_PORT', '2022'))
+_IDA_SERVER_HOST = os.environ.get('IDA_SERVER_HOST', '127.0.0.1')
+_IDA_SERVER_TOKEN = os.environ.get('IDA_MCP_TOKEN', '')
 _server_instance = None
 _server_thread   = None
+
+MAX_BODY_BYTES = 8 * 1024 * 1024
+
+
+def _is_loopback(host: str) -> bool:
+    if host in ('localhost', ''):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -42,11 +56,32 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def _check_auth(self) -> bool:
         if not _IDA_SERVER_TOKEN:
             return True
-        return self.headers.get('Authorization') == f"Bearer {_IDA_SERVER_TOKEN}"
+        provided = self.headers.get('Authorization') or ''
+        return hmac.compare_digest(provided, f"Bearer {_IDA_SERVER_TOKEN}")
 
-    def do_GET(self):
+    def _host_is_loopback(self) -> bool:
+        host = (self.headers.get('Host') or '').rsplit(':', 1)[0].strip('[]')
+        return _is_loopback(host)
+
+    def _reject(self) -> bool:
+        """Send an error response unless the request may execute IDAPython.
+
+        Browser-driven requests are always refused (CSRF / DNS rebinding against
+        this port), and an untokenised server only answers loopback Hosts.
+        """
+        if self.headers.get('Origin') or self.headers.get('Referer'):
+            self._send_json({'error': 'Forbidden: cross-origin request'}, 403)
+            return True
+        if not _IDA_SERVER_TOKEN and not self._host_is_loopback():
+            self._send_json({'error': 'Forbidden: non-loopback Host without IDA_MCP_TOKEN'}, 403)
+            return True
         if not self._check_auth():
             self._send_json({'error': 'Unauthorized'}, 401)
+            return True
+        return False
+
+    def do_GET(self):
+        if self._reject():
             return
 
         if self.path in ('/', '/api/v1/info', '/info'):
@@ -72,11 +107,17 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._send_json({'error': 'not found'}, 404)
 
     def do_POST(self):
-        if not self._check_auth():
-            self._send_json({'error': 'Unauthorized'}, 401)
+        if self._reject():
             return
 
-        length = int(self.headers.get('Content-Length', 0))
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+        except ValueError:
+            self._send_json({'error': 'invalid Content-Length'}, 400)
+            return
+        if length < 0 or length > MAX_BODY_BYTES:
+            self._send_json({'error': 'payload too large'}, 413)
+            return
         body_bytes = self.rfile.read(length) if length else b''
         try:
             body = json.loads(body_bytes.decode('utf-8')) if body_bytes else {}
@@ -143,6 +184,17 @@ def start(port: int | None = None, host: str | None = None):
 
     bind_port = port or _IDA_SERVER_PORT
     bind_host = host or _IDA_SERVER_HOST
+
+    # The server executes arbitrary IDAPython, so binding off loopback requires
+    # a token.
+    if not _is_loopback(bind_host) and not _IDA_SERVER_TOKEN:
+        raise RuntimeError(
+            f'[MCO] Refusing to bind {bind_host}: set IDA_MCP_TOKEN before exposing '
+            'the IDAPython exec endpoint off loopback, or bind 127.0.0.1.'
+        )
+    if not _IDA_SERVER_TOKEN:
+        print('[MCO] WARNING: IDA_MCP_TOKEN is not set — any local process can '
+              'execute IDAPython through this port.')
 
     server = http.server.HTTPServer((bind_host, bind_port), _Handler)
     _server_instance = server

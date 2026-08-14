@@ -279,6 +279,8 @@ def tool_functions(offset: int = 0, limit: int = 100, pattern: str = "") -> str:
     err = _require_ida()
     if err:
         return err
+    offset = _int(offset, 0, 0, 1_000_000)
+    limit = _int(limit, 100, 1, 5000)
     try:
         result = _client().exec_python_json(f"""
 import idautils, idc, json
@@ -392,6 +394,8 @@ def tool_strings(min_len: int = 4, limit: int = 200) -> str:
     err = _require_ida()
     if err:
         return err
+    min_len = _int(min_len, 4, 1, 1024)
+    limit = _int(limit, 200, 1, 5000)
     try:
         result = _client().exec_python_json(f"""
 import idautils, idc, json
@@ -415,6 +419,7 @@ def tool_names(pattern: str = "", limit: int = 200) -> str:
     err = _require_ida()
     if err:
         return err
+    limit = _int(limit, 200, 1, 5000)
     try:
         result = _client().exec_python_json(f"""
 import idautils, idc, json
@@ -438,6 +443,7 @@ def tool_disassemble(address: str, count: int = 20, function: bool = False) -> s
     err = _require_ida()
     if err:
         return err
+    count = _int(count, 20, 1, 4096)
     try:
         if function:
             result = _client().exec_python_json(f"""
@@ -512,6 +518,7 @@ def tool_xrefs_to(address: str, limit: int = 50) -> str:
     err = _require_ida()
     if err:
         return err
+    limit = _int(limit, 50, 1, 5000)
     try:
         result = _client().exec_python_json(f"""
 import idautils, idc, json
@@ -534,6 +541,7 @@ def tool_xrefs_from(address: str, limit: int = 50) -> str:
     err = _require_ida()
     if err:
         return err
+    limit = _int(limit, 50, 1, 5000)
     try:
         result = _client().exec_python_json(f"""
 import idautils, idc, json
@@ -655,6 +663,7 @@ def tool_read_bytes(address: str, size: int = 64) -> str:
     err = _require_ida()
     if err:
         return err
+    size = _int(size, 64, 1, 1 << 20)
     try:
         result = _client().exec_python_json(f"""
 import idc, idaapi, json
@@ -685,6 +694,7 @@ def tool_search(pattern: str, kind: str = "bytes", limit: int = 20) -> str:
     err = _require_ida()
     if err:
         return err
+    limit = _int(limit, 20, 1, 5000)
     try:
         if kind == "bytes":
             result = _client().exec_python_json(f"""
@@ -1139,6 +1149,7 @@ def tool_call_tree(address: str, depth: int = 3) -> str:
     err = _require_ida()
     if err:
         return err
+    depth = _int(depth, 3, 1, 10)
     try:
         result = _client().exec_python_json(f"""
 import idaapi, idautils, idc, json
@@ -1386,6 +1397,7 @@ def tool_get_pseudocode_all_functions(limit: int = 20) -> str:
     err = _require_ida()
     if err:
         return err
+    limit = _int(limit, 20, 1, 1000)
     try:
         result = _client().exec_python_json(f"""
 import idautils, idc, idaapi, json
@@ -1423,9 +1435,22 @@ print(json.dumps({{"has_hexrays": has_hexrays, "results": results, "count": len(
         return f"ERROR: {_friendly_error(str(e))}"
 
 
+def _int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    """Coerce a tool argument to an int inside [minimum, maximum].
+
+    Numeric arguments are interpolated into generated IDAPython source, so a
+    non-numeric value must never reach the template.
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, n))
+
+
 def _parse_addr(address: str) -> str:
     """Return an IDAPython-safe address expression from a string."""
-    address = address.strip()
+    address = str(address).strip()
     if address.startswith("0x") or address.startswith("0X"):
         return str(int(address, 16))
     if re.fullmatch(r"[0-9a-fA-F]+", address) and len(address) >= 4:
