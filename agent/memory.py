@@ -9,12 +9,15 @@ Unlike MCP servers that forget everything between requests, this system:
 """
 
 import json
+import logging
 import os
 import time
 import hashlib
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
+
+log = logging.getLogger("x64dbg.memory")
 
 
 @dataclass
@@ -91,8 +94,8 @@ class MemoryStore:
         if kb_path.exists():
             try:
                 return json.loads(kb_path.read_text())
-            except (json.JSONDecodeError, OSError):
-                pass
+            except (json.JSONDecodeError, OSError) as e:
+                log.warning("Could not read knowledge base %s: %s; starting fresh", kb_path, e)
         return {
             "total_sessions": 0,
             "common_goals": {},
@@ -137,7 +140,8 @@ class MemoryStore:
                     sessions.append(session)
                     if len(sessions) >= limit:
                         break
-            except (json.JSONDecodeError, TypeError, OSError):
+            except (json.JSONDecodeError, TypeError, OSError) as e:
+                log.warning("Skipping unreadable session file %s: %s", f, e)
                 continue
 
         return sessions
@@ -153,8 +157,8 @@ class MemoryStore:
             try:
                 data = json.loads(path.read_text())
                 return FunctionInfo(**data)
-            except (json.JSONDecodeError, TypeError):
-                pass
+            except (json.JSONDecodeError, TypeError) as e:
+                log.warning("Corrupt function file %s: %s", path, e)
         return None
 
     def search_functions(self, tag: str = None, name_pattern: str = None) -> list[FunctionInfo]:
@@ -169,7 +173,8 @@ class MemoryStore:
                 if name_pattern and name_pattern.lower() not in func.name.lower():
                     continue
                 results.append(func)
-            except (json.JSONDecodeError, TypeError):
+            except (json.JSONDecodeError, TypeError) as e:
+                log.warning("Skipping unreadable function file %s: %s", f, e)
                 continue
         return results
 
@@ -311,10 +316,11 @@ class MemoryStore:
                         if not any(p.name == pattern.name and p.pattern == pattern.pattern
                                    for p in self._builtin_patterns):
                             self._builtin_patterns.append(pattern)
-                    except TypeError:
+                    except TypeError as e:
+                        log.warning("Skipping malformed custom pattern %r: %s", item, e)
                         continue
-            except (json.JSONDecodeError, OSError):
-                pass
+            except (json.JSONDecodeError, OSError) as e:
+                log.warning("Could not load custom patterns from %s: %s", patterns_file, e)
 
     def add_custom_pattern(self, pattern: PatternSignature):
         """Add a user-discovered pattern to the knowledge base."""
@@ -327,7 +333,7 @@ class MemoryStore:
         if patterns_file.exists():
             try:
                 existing = json.loads(patterns_file.read_text())
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as e:
+                log.warning("Custom patterns file %s is corrupt (%s); overwriting", patterns_file, e)
         existing.append(asdict(pattern))
         patterns_file.write_text(json.dumps(existing, indent=2))

@@ -27,6 +27,7 @@ Environment variables:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sys
@@ -38,6 +39,8 @@ import urllib.parse
 import urllib.request
 import uuid
 from typing import Any
+
+log = logging.getLogger("ida.mcp")
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "ida"
@@ -189,8 +192,8 @@ class IDAClient:
         """Try the /api/v1/info endpoint, fall back to Python."""
         try:
             return self._get("/api/v1/info")
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("/api/v1/info unavailable (%s); falling back to IDAPython", e)
         return self.exec_python_json("""
 import idc, idaapi, json, os
 info = idaapi.get_inf_structure()
@@ -826,8 +829,9 @@ else:
         try:
             decompiled = tool_decompile(result.get("start", address))
             parts.append(decompiled)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("Decompilation failed for %s: %s", address, e)
+            parts.append(_section("DECOMPILE", f"(unavailable: {_friendly_error(str(e))})"))
         return "\n\n".join(parts)
     except Exception as e:
         return f"ERROR: {_friendly_error(str(e))}"

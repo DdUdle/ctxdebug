@@ -9,6 +9,7 @@ and uses skills (tools) to interact with x64dbg.
 """
 
 import json
+import logging
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -17,6 +18,8 @@ from typing import Any, Callable, Optional
 
 from .memory import MemoryStore, DebugSession
 from .skills import SkillRegistry, SkillResult
+
+log = logging.getLogger("x64dbg.agent")
 
 
 class AgentState(Enum):
@@ -93,7 +96,7 @@ class DebuggerAgent:
             try:
                 cb(data)
             except Exception:
-                pass
+                log.exception("Callback for event %r raised", event)
 
     # ------------------------------------------------------------------
     # ReAct Loop — the brain
