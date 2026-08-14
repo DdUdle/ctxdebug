@@ -25,6 +25,7 @@ Workflow from the model side:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -35,6 +36,8 @@ import time
 import uuid
 from queue import Empty, Queue
 from typing import Any, Callable
+
+log = logging.getLogger("windbg.mcp")
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "windbg"
@@ -191,7 +194,7 @@ class CdbSession:
                     break
                 self.out_q.put(line)
         except Exception:
-            pass
+            log.exception("cdb.exe read loop terminated unexpectedly")
         finally:
             self.out_q.put(None)
 

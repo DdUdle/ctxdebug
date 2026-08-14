@@ -125,8 +125,9 @@ class IDAClient:
                 with urllib.request.urlopen(req, timeout=3) as r:
                     if r.status == 200:
                         return ep
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("IDA endpoint probe %s failed: %s", ep, e)
+                continue
         return None
 
     @property

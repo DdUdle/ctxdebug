@@ -156,6 +156,7 @@ class SubServer:
             try:
                 resp = json.loads(line.strip())
             except json.JSONDecodeError:
+                log.debug("%s: ignoring non-JSON stdout line: %r", self.name, line[:200])
                 continue
             if resp.get("id") == req_id:
                 return resp

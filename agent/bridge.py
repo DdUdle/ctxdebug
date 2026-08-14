@@ -12,12 +12,15 @@ Key improvements over existing MCP bridges:
 
 import asyncio
 import json
+import logging
 import os
 import struct
 import time
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, Callable, Optional
+
+log = logging.getLogger("x64dbg.bridge")
 
 
 class ConnectionState(IntEnum):
@@ -187,6 +190,10 @@ class X64DbgBridge:
                     None,
                 )
                 if handle == INVALID:
+                    err = ctypes.windll.kernel32.GetLastError()
+                    log.warning("Named pipe %s not available (CreateFileW GetLastError=%d)",
+                                self.pipe_name, err)
+                    self.state = ConnectionState.DISCONNECTED
                     return False
 
                 # Wrap the Win32 handle in asyncio streams via ProactorEventLoop
@@ -206,7 +213,8 @@ class X64DbgBridge:
                     reader, writer = await asyncio.open_unix_connection(sock_path)
                     self._pipe_reader = reader
                     self._pipe_writer = writer
-                except (FileNotFoundError, ConnectionRefusedError):
+                except (FileNotFoundError, ConnectionRefusedError) as e:
+                    log.warning("Unix socket %s not available: %s", sock_path, e)
                     self.state = ConnectionState.DISCONNECTED
                     return False
 
@@ -217,6 +225,7 @@ class X64DbgBridge:
             return True
 
         except Exception:
+            log.exception("Pipe connection to %s failed", self.pipe_name)
             self.state = ConnectionState.DISCONNECTED
             return False
 
@@ -237,8 +246,9 @@ class X64DbgBridge:
                     self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
                     await self._flush_command_queue()
                     return True
+                log.warning("HTTP status probe to %s returned %d", self.http_url, resp.status)
         except Exception:
-            pass
+            log.exception("HTTP connection to %s failed", self.http_url)
 
         # Clean up session on failure
         if session:
@@ -431,7 +441,7 @@ class X64DbgBridge:
                         try:
                             handler(msg.payload)
                         except Exception:
-                            pass
+                            log.exception("Event handler for %r raised", event_name)
 
                 elif msg.msg_type == MsgType.HEARTBEAT:
                     # Respond with ACK
