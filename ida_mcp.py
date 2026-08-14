@@ -39,6 +39,8 @@ import urllib.request
 import uuid
 from typing import Any
 
+from mco_common import kv_block as _kv, section as _section
+
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "ida"
 SERVER_VERSION = "1.0.0"
@@ -223,20 +225,6 @@ def _client() -> IDAClient:
 # ---------------------------------------------------------------------------
 # Output formatting helpers
 # ---------------------------------------------------------------------------
-
-def _section(title: str, body: str) -> str:
-    body = (body or "").strip("\n")
-    if not body:
-        body = "(empty)"
-    return f"### {title}\n{body}"
-
-
-def _kv(pairs: list[tuple[str, Any]]) -> str:
-    if not pairs:
-        return "(none)"
-    w = max(len(k) for k, _ in pairs)
-    return "\n".join(f"{k.ljust(w)} = {v}" for k, v in pairs)
-
 
 def _require_ida() -> str | None:
     if not _client().ping():

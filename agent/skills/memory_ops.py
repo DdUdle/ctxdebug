@@ -2,7 +2,7 @@
 Memory Operation Skills — read, write, search, map, allocate.
 """
 
-from . import SkillDefinition, SkillResult, SkillRegistry
+from . import SkillDefinition, SkillResult, SkillRegistry, parse_address
 
 
 async def skill_read_memory(bridge, context, args):
@@ -12,8 +12,7 @@ async def skill_read_memory(bridge, context, args):
     if address is None:
         return SkillResult(success=False, summary="Missing 'address' argument")
 
-    if isinstance(address, str):
-        address = int(address, 16) if address.startswith("0x") else int(address)
+    address = parse_address(address)
 
     data = await bridge.read_memory(address, size)
     if data is None:
@@ -42,8 +41,7 @@ async def skill_write_memory(bridge, context, args):
     if address is None or not data_hex:
         return SkillResult(success=False, summary="Missing 'address' or 'data' argument")
 
-    if isinstance(address, str):
-        address = int(address, 16) if address.startswith("0x") else int(address)
+    address = parse_address(address)
 
     data = bytes.fromhex(data_hex)
     success = await bridge.write_memory(address, data)
@@ -59,8 +57,7 @@ async def skill_read_string(bridge, context, args):
     if address is None:
         return SkillResult(success=False, summary="Missing 'address' argument")
 
-    if isinstance(address, str):
-        address = int(address, 16) if address.startswith("0x") else int(address)
+    address = parse_address(address)
 
     string = await bridge.read_memory_string(address, args.get("max_len", 256))
     if string is None:

@@ -27,6 +27,7 @@ x64-agent = "agent.__main__:main"
 
 [tool.setuptools]
 py-modules = [
+    "mco_common",
     "windbg_mcp",
     "ida_mcp",
     "ida_server_plugin",

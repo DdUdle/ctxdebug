@@ -27,6 +27,8 @@ import urllib.error
 from contextlib import contextmanager
 from typing import Any
 
+from mco_common import serve_stdio, text_error, text_result
+
 logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
 log = logging.getLogger("mco")
 
@@ -730,17 +732,10 @@ class MCPServer:
         ]
 
     def _ok(self, data: Any) -> dict:
-        text = json.dumps(data, indent=2) if not isinstance(data, str) else data
-        return {
-            "content": [{"type": "text", "text": text}],
-            "isError": False
-        }
+        return text_result(data)
 
     def _err(self, msg: str) -> dict:
-        return {
-            "content": [{"type": "text", "text": f"ERROR: {msg}"}],
-            "isError": True
-        }
+        return text_error(msg)
 
     def handle(self, request: dict) -> dict | None:
         method = request.get("method")
@@ -808,18 +803,7 @@ class MCPServer:
 
 def main():
     server = MCPServer()
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            request = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-
-        response = server.handle(request)
-        if response is not None:
-            print(json.dumps(response), flush=True)
+    serve_stdio(server.handle)
 
 
 if __name__ == "__main__":
