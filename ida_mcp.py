@@ -17,7 +17,7 @@ Add to Claude Code:
     claude mcp add ida -- python "C:\\path\\to\\ida_mcp.py"
 
 Environment variables:
-    IDA_MCP_HOST=localhost   (default: localhost)
+    IDA_MCP_HOST=127.0.0.1   (default: 127.0.0.1)
     IDA_MCP_PORT=2022        (default: 2022)
     IDA_MCP_TIMEOUT=30       (default: 30 seconds)
     IDA_MCP_TOKEN=           (optional Bearer token)
@@ -39,7 +39,12 @@ import urllib.request
 import uuid
 from typing import Any
 
-from mco_common import kv_block as _kv, section as _section
+from mco_common import (
+    kv_block as _kv,
+    read_stdio_message,
+    section as _section,
+    write_stdio_message,
+)
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "ida"
@@ -49,6 +54,44 @@ IDA_PATH = os.environ.get(
     "IDA_PATH",
     r"C:\Program Files\IDA Professional 9.2",
 )
+
+
+def _endpoint_probe_succeeded(resp: dict, key: str | None) -> bool:
+    """True only if the probe script's ``{"ok": true}`` came back.
+
+    Any JSON object used to count as success, so a 404 body like
+    ``{"error": "not found"}`` could lock the client onto a dead endpoint.
+    """
+    if not isinstance(resp, dict) or resp.get("error"):
+        return False
+    raw_out = resp.get(key, "") if key else ""
+    if isinstance(raw_out, dict):
+        return raw_out.get("ok") is True
+    if not isinstance(raw_out, str):
+        return False
+    try:
+        parsed = json.loads(raw_out.strip().splitlines()[-1])
+        return isinstance(parsed, dict) and parsed.get("ok") is True
+    except Exception:
+        return False
+
+
+def _json_from_ida_output(raw: str) -> Any:
+    """Parse JSON printed by an IDAPython snippet, ignoring log prefixes."""
+    raw = (raw or "").strip()
+    if not raw:
+        raise ValueError("No JSON in IDA output: ''")
+    decoder = json.JSONDecoder()
+    found = None
+    for i, ch in enumerate(raw):
+        if ch in "{[":
+            try:
+                found, _ = decoder.raw_decode(raw, i)
+            except json.JSONDecodeError:
+                continue
+    if found is not None:
+        return found
+    raise ValueError(f"No JSON in IDA output: {raw[:300]!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -82,13 +125,14 @@ class IDAClient:
         timeout: float | None = None,
         token: str | None = None,
     ) -> None:
-        self.host = host or os.environ.get("IDA_MCP_HOST", "localhost")
+        self.host = host or os.environ.get("IDA_MCP_HOST", "127.0.0.1")
         self.port = int(port or os.environ.get("IDA_MCP_PORT", "2022"))
         self.timeout = float(timeout or os.environ.get("IDA_MCP_TIMEOUT", "30"))
         self.token = token or os.environ.get("IDA_MCP_TOKEN", "")
         self.base = f"http://{self.host}:{self.port}"
         self._py_ep: tuple[str, str, str | None] | None = None  # discovered endpoint
         self._lock = threading.Lock()
+        self._alive_until = 0.0
 
     # ------------------------------------------------------------------
     # Low-level HTTP
@@ -139,16 +183,15 @@ class IDAClient:
             body = tmpl.replace("{code_json}", probe_json)
             try:
                 resp = self._post(path, body)
-                # Check we got something sensible
-                raw_out = resp.get(key, "") if key else json.dumps(resp)
-                if "ok" in raw_out or isinstance(resp, dict):
+                if _endpoint_probe_succeeded(resp, key):
                     return path, tmpl, key
             except Exception:
                 continue
         raise RuntimeError(
             f"Could not find IDAPython execution endpoint at {self.base}.\n"
-            "Make sure IDA Pro is open and the HTTP server is running.\n"
-            "In IDA Python console: import ida_httpd; ida_httpd.start()"
+            "Make sure IDA Pro is open and ida_server_plugin.py is running.\n"
+            "In IDA Python console:\n"
+            "  exec(open(r'path\\\\to\\\\ida_server_plugin.py').read())"
         )
 
     def exec_python(self, code: str) -> str:
@@ -160,6 +203,9 @@ class IDAClient:
         code_json = json.dumps(textwrap.dedent(code).strip())
         body = tmpl.replace("{code_json}", code_json)
         resp = self._post(path, body)
+        err = resp.get("error") if isinstance(resp, dict) else None
+        if err:
+            raise RuntimeError(str(err))
         if key:
             out = resp.get(key, "")
         else:
@@ -168,45 +214,61 @@ class IDAClient:
 
     def exec_python_json(self, code: str) -> Any:
         """Execute IDAPython that prints a JSON result. Parses and returns it."""
-        raw = self.exec_python(code)
-        raw = raw.strip()
-        # Find the last complete JSON object/array in the output
-        for start in range(len(raw)):
-            if raw[start] in ("{", "["):
-                try:
-                    return json.loads(raw[start:])
-                except json.JSONDecodeError:
-                    pass
-        raise ValueError(f"No JSON in IDA output: {raw[:300]!r}")
+        return _json_from_ida_output(self.exec_python(code))
 
     def ping(self) -> bool:
-        """Check if IDA is reachable."""
+        """Check if IDA is reachable. Cached for 2s to avoid a round-trip per tool."""
+        now = time.monotonic()
+        if now < self._alive_until and self._py_ep is not None:
+            return True
         try:
             result = self.exec_python_json("import json; print(json.dumps({'alive': True}))")
-            return result.get("alive") is True
+            ok = result.get("alive") is True
+            self._alive_until = now + 2.0 if ok else 0.0
+            return ok
         except Exception:
+            self._alive_until = 0.0
             return False
 
     def get_info(self) -> dict:
         """Try the /api/v1/info endpoint, fall back to Python."""
         try:
-            return self._get("/api/v1/info")
+            info = self._get("/api/v1/info")
+            if isinstance(info, dict) and not info.get("error"):
+                return info
         except Exception:
             pass
         return self.exec_python_json("""
-import idc, idaapi, json, os
-info = idaapi.get_inf_structure()
+import idc, idaapi, json
+def _bits_dll():
+    try:
+        inf = idaapi.get_inf_structure()
+        return (64 if inf.is_64bit() else 32, bool(inf.is_dll()))
+    except Exception:
+        bits = 64 if getattr(idaapi, "inf_is_64bit", lambda: False)() else 32
+        is_dll = bool(getattr(idaapi, "inf_is_dll", lambda: False)())
+        return bits, is_dll
+bits, is_dll = _bits_dll()
+md5 = ""
+if hasattr(idc, "retrieve_input_file_md5"):
+    try:
+        md5 = idc.retrieve_input_file_md5().hex()
+    except Exception:
+        md5 = ""
+proc = idaapi.inf_get_procname() if hasattr(idaapi, "inf_get_procname") else (
+    idc.get_inf_attr(idc.INF_PROCNAME) if hasattr(idc, "INF_PROCNAME") else ""
+)
 print(json.dumps({
     "input_file": idc.get_input_file_path(),
-    "input_md5": idc.retrieve_input_file_md5().hex() if hasattr(idc, 'retrieve_input_file_md5') else '',
+    "input_md5": md5,
     "min_ea": hex(idc.get_inf_attr(idc.INF_MIN_EA)),
     "max_ea": hex(idc.get_inf_attr(idc.INF_MAX_EA)),
     "entry_point": hex(idc.get_inf_attr(idc.INF_START_IP)),
     "image_base": hex(idaapi.get_imagebase()),
-    "processor": idc.get_inf_attr(idc.INF_PROCNAME) if hasattr(idc, 'INF_PROCNAME') else idaapi.inf_get_procname(),
-    "bits": 64 if info.is_64bit() else 32,
+    "processor": proc,
+    "bits": bits,
     "file_type": idc.get_file_type_name(),
-    "is_dll": bool(info.is_dll()),
+    "is_dll": is_dll,
 }))
 """)
 
@@ -284,16 +346,20 @@ def tool_functions(offset: int = 0, limit: int = 100, pattern: str = "") -> str:
     try:
         result = _client().exec_python_json(f"""
 import idautils, idc, json
-funcs = []
+page = []
+total = 0
 pattern = {json.dumps(pattern)}
+offset = {offset}
+limit = {limit}
 for ea in idautils.Functions():
     name = idc.get_func_name(ea)
     if pattern and pattern.lower() not in name.lower():
         continue
-    funcs.append({{"ea": hex(ea), "name": name,
-        "size": idc.get_func_attr(ea, idc.FUNCATTR_END) - ea}})
-page = funcs[{offset}:{offset}+{limit}]
-print(json.dumps({{"total": len(funcs), "offset": {offset}, "functions": page}}))
+    if total >= offset and len(page) < limit:
+        page.append({{"ea": hex(ea), "name": name,
+            "size": idc.get_func_attr(ea, idc.FUNCATTR_END) - ea}})
+    total += 1
+print(json.dumps({{"total": total, "offset": offset, "functions": page}}))
 """)
         total = result.get("total", 0)
         funcs = result.get("functions", [])
@@ -589,17 +655,17 @@ def tool_comment(address: str, text: str, kind: str = "regular") -> str:
         return err
     try:
         kind_map = {
-            "regular": "set_cmt(ea, text, 0)",
-            "repeatable": "set_cmt(ea, text, 1)",
-            "anterior": "set_func_cmt(ea, text, 0)",
-            "posterior": "set_func_cmt(ea, text, 1)",
+            "regular": "idc.set_cmt(ea, text, 0)",
+            "repeatable": "idc.set_cmt(ea, text, 1)",
+            "anterior": "idc.update_extra_cmt(ea, idc.E_PREV, text)",
+            "posterior": "idc.update_extra_cmt(ea, idc.E_NEXT, text)",
         }
-        call = kind_map.get(kind, "set_cmt(ea, text, 0)")
+        stmt = kind_map.get(kind, "idc.set_cmt(ea, text, 0)")
         result = _client().exec_python_json(f"""
 import idc, json
 ea = {_parse_addr(address)}
 text = {json.dumps(text)}
-idc.{call}
+{stmt}
 print(json.dumps({{"ok": True, "ea": hex(ea), "kind": {json.dumps(kind)}}}))
 """)
         return _section(f"COMMENT @ {address}", _kv([("kind", kind), ("text", text), ("ok", str(result.get("ok")))]))
@@ -858,20 +924,49 @@ def tool_struct(name: str) -> str:
         return err
     try:
         result = _client().exec_python_json(f"""
-import idc, idaapi, json
+import json
 name = {json.dumps(name)}
-sid = idc.get_struc_id(name)
-if sid == idc.BADADDR:
-    print(json.dumps({{"error": f"struct not found: {{name}}"}}))
+members = []
+size = 0
+found = False
+try:
+    import ida_typeinf
+    tif = ida_typeinf.tinfo_t()
+    if tif.get_named_type(None, name):
+        found = True
+        size = tif.get_size()
+        udt = ida_typeinf.udt_type_data_t()
+        if tif.get_udt_details(udt):
+            for m in udt:
+                members.append({{
+                    "offset": int(m.offset // 8),
+                    "name": str(m.name),
+                    "size": int(m.size // 8),
+                }})
+except Exception:
+    pass
+if not found:
+    try:
+        import idc, idaapi
+        sid = idc.get_struc_id(name)
+        if sid != idc.BADADDR:
+            found = True
+            s = idaapi.get_struc(sid)
+            size = idc.get_struc_size(sid)
+            if s:
+                for i in range(s.memqty):
+                    m = s.get_member(i)
+                    members.append({{
+                        "offset": m.soff,
+                        "name": idc.get_member_name(sid, m.soff),
+                        "size": m.eoff - m.soff,
+                    }})
+    except Exception:
+        pass
+if not found:
+    print(json.dumps({{"error": "struct not found: " + name}}))
 else:
-    s = idaapi.get_struc(sid)
-    members = []
-    for i in range(s.memqty):
-        m = s.get_member(i)
-        mname = idc.get_member_name(sid, m.soff)
-        mtype = idc.get_member_tinfo(sid, m.soff)
-        members.append({{"offset": m.soff, "name": mname, "size": m.eoff - m.soff}})
-    print(json.dumps({{"name": name, "size": idc.get_struc_size(sid), "members": members}}))
+    print(json.dumps({{"name": name, "size": size, "members": members}}))
 """)
         if "error" in result:
             return f"ERROR: {result['error']}"
@@ -923,14 +1018,26 @@ def tool_apply_signature(sig_file: str) -> str:
         return err
     try:
         result = _client().exec_python_json(f"""
-import idc, idaapi, json
+import json
 sig = {json.dumps(sig_file)}
-# Load sig file
-ok = idaapi.plan_and_wait(0, 0xffffffffffffffff)  # reanalyze
-if idc.ApplySig(sig):
-    print(json.dumps({{"ok": True, "sig": sig}}))
-else:
-    print(json.dumps({{"ok": False, "sig": sig, "error": "ApplySig failed — check path"}}))
+ok = False
+err = "no FLIRT apply API found"
+try:
+    import ida_funcs
+    if hasattr(ida_funcs, "plan_to_apply_idasgn"):
+        ok = bool(ida_funcs.plan_to_apply_idasgn(sig))
+        err = "" if ok else "plan_to_apply_idasgn failed — check path"
+except Exception as e:
+    err = str(e)
+if not ok:
+    try:
+        import idc
+        if hasattr(idc, "ApplySig"):
+            ok = bool(idc.ApplySig(sig))
+            err = "" if ok else "ApplySig failed — check path"
+    except Exception as e:
+        err = str(e)
+print(json.dumps({{"ok": ok, "sig": sig, "error": err or None}}))
 """)
         if not result.get("ok"):
             return f"ERROR: {result.get('error', 'failed')}"
@@ -946,9 +1053,8 @@ def tool_find_crypto() -> str:
         return err
     try:
         result = _client().exec_python_json("""
-import idautils, idc, idaapi, json
+import idc, idaapi, json
 
-# Known crypto constants (hash init vectors, AES S-box markers)
 CRYPTO_CONSTS = {
     0x67452301: "MD5/SHA1 init H0",
     0xEFCDAB89: "MD5/SHA1 init H1",
@@ -962,28 +1068,21 @@ CRYPTO_CONSTS = {
     0x1F83D9AB: "SHA-256 init H5",
     0x5BE0CD19: "SHA-256 init H6",
     0x52096AD5: "AES S-box row 0",
-    0x30000000: "RC4 KSA marker (approx)",
-    0x61C88647: "AES MixColumns constant",
     0x9E3779B9: "TEA/XTEA delta constant",
-    0x61C88647: "AES round key constant",
+    0x61C88647: "AES round-key constant",
 }
 
-
 hits = []
-for seg_ea in idautils.Segments():
-    for ea in idautils.Items(seg_ea, idc.get_segm_end(seg_ea)):
-        val = idc.get_wide_dword(ea)
-        if val in CRYPTO_CONSTS:
-            hits.append({"ea": hex(ea), "value": hex(val), "meaning": CRYPTO_CONSTS[val]})
-        # XOR patterns (detect repeated XOR operations)
-        disasm = idc.generate_disasm_line(ea, 0)
-        if disasm and 'xor' in disasm.lower() and 'eax, eax' not in disasm and 'xor eax, eax' not in disasm:
-            if any(c in disasm for c in ['0x', 'dword', 'qword']):
-                hits.append({"ea": hex(ea), "value": disasm, "meaning": "XOR pattern (possible crypto)"})
-        if len(hits) > 100:
-            break
-    if len(hits) > 100:
-        break
+start = idc.get_inf_attr(idc.INF_MIN_EA)
+end = idc.get_inf_attr(idc.INF_MAX_EA)
+for val, meaning in CRYPTO_CONSTS.items():
+    pat = "%02X %02X %02X %02X" % (val & 0xff, (val >> 8) & 0xff, (val >> 16) & 0xff, (val >> 24) & 0xff)
+    ea = idaapi.find_binary(start, end, pat, 16, idc.SEARCH_DOWN)
+    n = 0
+    while ea != idc.BADADDR and n < 8 and len(hits) < 100:
+        hits.append({"ea": hex(ea), "value": hex(val), "meaning": meaning})
+        n += 1
+        ea = idaapi.find_binary(ea + 1, end, pat, 16, idc.SEARCH_DOWN)
 
 print(json.dumps({"hits": hits[:100], "count": len(hits)}))
 """)
@@ -1043,6 +1142,16 @@ for s in sc:
     if len(findings["string_indicators"]) > 20:
         break
 
+start = idc.get_inf_attr(idc.INF_MIN_EA)
+end = idc.get_inf_attr(idc.INF_MAX_EA)
+for label, pat in BOSSIX_BYTES.items():
+    ea = idaapi.find_binary(start, end, pat, 16, idc.SEARCH_DOWN)
+    n = 0
+    while ea != idc.BADADDR and n < 8:
+        findings["byte_patterns"].append({"ea": hex(ea), "pattern": label, "bytes": pat})
+        n += 1
+        ea = idaapi.find_binary(ea + 1, end, pat, 16, idc.SEARCH_DOWN)
+
 print(json.dumps(findings))
 """)
         parts = []
@@ -1054,6 +1163,10 @@ print(json.dumps(findings))
         if strs:
             lines = [f"  {s['ea']}  {s['string']!r}" for s in strs]
             parts.append(_section(f"SUSPICIOUS STRINGS ({len(strs)})", "\n".join(lines)))
+        pats = result.get("byte_patterns", [])
+        if pats:
+            lines = [f"  {p['ea']}  {p.get('pattern', '?')}  {p.get('bytes', '')}" for p in pats]
+            parts.append(_section(f"BYTE PATTERNS ({len(pats)})", "\n".join(lines)))
         if not parts:
             parts.append(_section("ANTI-DEBUG SCAN", "No obvious anti-debug indicators found."))
         return "\n\n".join(parts)
@@ -1288,10 +1401,18 @@ def tool_export_idb_info() -> str:
         result = _client().exec_python_json("""
 import idc, idaapi, idautils, json
 
-info_struct = idaapi.get_inf_structure()
-func_count = len(list(idautils.Functions()))
-seg_count = len(list(idautils.Segments()))
-entry_count = len(list(idautils.Entries()))
+def _bits_dll():
+    try:
+        inf = idaapi.get_inf_structure()
+        return (64 if inf.is_64bit() else 32, bool(inf.is_dll()))
+    except Exception:
+        bits = 64 if getattr(idaapi, "inf_is_64bit", lambda: False)() else 32
+        is_dll = bool(getattr(idaapi, "inf_is_dll", lambda: False)())
+        return bits, is_dll
+bits, is_dll = _bits_dll()
+func_count = sum(1 for _ in idautils.Functions())
+seg_count = sum(1 for _ in idautils.Segments())
+entry_count = sum(1 for _ in idautils.Entries())
 nim = idaapi.get_import_module_qty()
 
 sc = idautils.Strings()
@@ -1323,8 +1444,8 @@ print(json.dumps({
     "md5": md5_hex,
     "sha256": sha256_hex,
     "image_base": hex(idaapi.get_imagebase()),
-    "bits": 64 if info_struct.is_64bit() else 32,
-    "is_dll": bool(info_struct.is_dll()),
+    "bits": bits,
+    "is_dll": is_dll,
     "min_ea": hex(idc.get_inf_attr(idc.INF_MIN_EA)),
     "max_ea": hex(idc.get_inf_attr(idc.INF_MAX_EA)),
     "entry_count": entry_count,
@@ -1852,26 +1973,30 @@ def _dispatch(name: str, args: dict) -> str:
     return f"Unknown tool: {name}"
 
 
-def _respond(msg_id: Any, result: Any) -> None:
-    out = json.dumps({"jsonrpc": "2.0", "id": msg_id, "result": result})
-    sys.stdout.write(out + "\n")
-    sys.stdout.flush()
+def _respond(msg_id: Any, result: Any, content_length: bool = False) -> None:
+    write_stdio_message(
+        {"jsonrpc": "2.0", "id": msg_id, "result": result},
+        content_length=content_length,
+    )
 
 
-def _error(msg_id: Any, code: int, message: str) -> None:
-    out = json.dumps({"jsonrpc": "2.0", "id": msg_id,
-                      "error": {"code": code, "message": message}})
-    sys.stdout.write(out + "\n")
-    sys.stdout.flush()
+def _error(msg_id: Any, code: int, message: str, content_length: bool = False) -> None:
+    write_stdio_message(
+        {"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}},
+        content_length=content_length,
+    )
 
 
 def _serve() -> None:
-    for raw_line in sys.stdin:
-        raw_line = raw_line.strip()
-        if not raw_line:
+    while True:
+        raw, content_length = read_stdio_message()
+        if raw is None:
+            break
+        raw = raw.strip()
+        if not raw:
             continue
         try:
-            msg = json.loads(raw_line)
+            msg = json.loads(raw)
         except json.JSONDecodeError:
             continue
 
@@ -1884,11 +2009,11 @@ def _serve() -> None:
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-            })
+            }, content_length)
         elif method in ("initialized", "notifications/initialized"):
             pass
         elif method == "tools/list":
-            _respond(msg_id, {"tools": TOOLS})
+            _respond(msg_id, {"tools": TOOLS}, content_length)
         elif method == "tools/call":
             tool_name = params.get("name", "")
             arguments = params.get("arguments") or {}
@@ -1896,13 +2021,15 @@ def _serve() -> None:
                 result_text = _dispatch(tool_name, arguments)
             except Exception as exc:
                 result_text = f"EXCEPTION: {exc}"
+            is_err = result_text.startswith("ERROR:") or result_text.startswith("EXCEPTION:")
             _respond(msg_id, {
-                "content": [{"type": "text", "text": result_text}]
-            })
+                "content": [{"type": "text", "text": result_text}],
+                "isError": is_err,
+            }, content_length)
         elif method == "ping":
-            _respond(msg_id, {})
+            _respond(msg_id, {}, content_length)
         elif msg_id is not None:
-            _error(msg_id, -32601, f"Method not found: {method}")
+            _error(msg_id, -32601, f"Method not found: {method}", content_length)
 
 
 if __name__ == "__main__":

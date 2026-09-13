@@ -134,6 +134,7 @@ class X64DbgBridge:
         self.pipe_name = pipe_name or self.PIPE_NAME
         self.http_url = http_url or self.HTTP_URL
         self.protocol = protocol
+        self._prefer_http = protocol == BridgeProtocol.HTTP
         self.x64dbg_path = x64dbg_path or self.X64DBG_PATH
         self._x64dbg_proc = None  # launched subprocess handle
         self.state = ConnectionState.DISCONNECTED
@@ -146,6 +147,8 @@ class X64DbgBridge:
         self._heartbeat_task = None
         self._read_task = None
         self._command_queue: list[PendingCommand] = []
+        self._reconnect_lock = asyncio.Lock()
+        self._reconnect_task = None
 
     @property
     def connected(self) -> bool:
@@ -160,15 +163,14 @@ class X64DbgBridge:
     # ------------------------------------------------------------------
     async def connect(self) -> bool:
         """Connect to x64dbg. Tries Named Pipe first, falls back to HTTP."""
-        if self.protocol == BridgeProtocol.NAMED_PIPE:
+        prefer_http = self._prefer_http
+        if not prefer_http:
             if await self._connect_pipe():
+                self.protocol = BridgeProtocol.NAMED_PIPE
                 return True
-            # Fallback to HTTP
+        if await self._connect_http():
             self.protocol = BridgeProtocol.HTTP
-
-        if self.protocol == BridgeProtocol.HTTP:
-            return await self._connect_http()
-
+            return True
         return False
 
     async def _connect_pipe(self) -> bool:
@@ -177,35 +179,15 @@ class X64DbgBridge:
         try:
             import sys
             if sys.platform == 'win32':
-                # Windows: open Named Pipe as a file-like object via proactor loop
-                import ctypes
-                import ctypes.wintypes as wt
-
-                GENERIC_READ = 0x80000000
-                GENERIC_WRITE = 0x40000000
-                OPEN_EXISTING = 3
-                INVALID = ctypes.c_void_p(-1).value
-
-                pipe_path = self.pipe_name.encode('utf-8') if isinstance(self.pipe_name, str) else self.pipe_name
-
-                handle = ctypes.windll.kernel32.CreateFileW(
-                    self.pipe_name,
-                    GENERIC_READ | GENERIC_WRITE,
-                    0,       # no sharing
-                    None,    # default security
-                    OPEN_EXISTING,
-                    0x40000000,  # FILE_FLAG_OVERLAPPED
-                    None,
-                )
-                if handle == INVALID:
-                    return False
-
-                # Wrap the Win32 handle in asyncio streams via ProactorEventLoop
                 loop = asyncio.get_running_loop()
+                if not hasattr(loop, 'create_pipe_connection'):
+                    self.state = ConnectionState.DISCONNECTED
+                    return False
                 reader = asyncio.StreamReader()
                 protocol = asyncio.StreamReaderProtocol(reader)
-                transport, _ = await loop._make_socket_transport(
-                    handle, protocol, extra={'peername': self.pipe_name}
+                transport, _ = await asyncio.wait_for(
+                    loop.create_pipe_connection(lambda: protocol, self.pipe_name),
+                    timeout=3.0,
                 )
                 writer = asyncio.StreamWriter(transport, protocol, reader, loop)
                 self._pipe_reader = reader
@@ -278,14 +260,18 @@ class X64DbgBridge:
         self._http_session = None
 
     async def reconnect(self):
-        """Reconnect with exponential backoff."""
-        self.state = ConnectionState.RECONNECTING
-        for delay in self.RECONNECT_DELAYS:
-            if await self.connect():
+        """Reconnect with exponential backoff. Concurrent callers share one attempt."""
+        async with self._reconnect_lock:
+            if self.state == ConnectionState.CONNECTED:
                 return True
-            await asyncio.sleep(delay)
-        self.state = ConnectionState.ERROR
-        return False
+            await self.disconnect()
+            self.state = ConnectionState.RECONNECTING
+            for delay in self.RECONNECT_DELAYS:
+                if await self.connect():
+                    return True
+                await asyncio.sleep(delay)
+            self.state = ConnectionState.ERROR
+            return False
 
     async def launch_x64dbg(self, target_exe: str = None, args: list = None,
                              wait_seconds: float = 3.0) -> bool:
@@ -374,7 +360,8 @@ class X64DbgBridge:
                 args=args, future=future, timeout=timeout,
             )
             self._command_queue.append(pending)
-            asyncio.create_task(self.reconnect())
+            if self._reconnect_task is None or self._reconnect_task.done():
+                self._reconnect_task = asyncio.create_task(self.reconnect())
             try:
                 return await asyncio.wait_for(future, timeout=timeout + 30)
             except asyncio.TimeoutError:
@@ -455,7 +442,8 @@ class X64DbgBridge:
 
         except asyncio.IncompleteReadError:
             self.state = ConnectionState.DISCONNECTED
-            asyncio.create_task(self.reconnect())
+            if self._reconnect_task is None or self._reconnect_task.done():
+                self._reconnect_task = asyncio.create_task(self.reconnect())
         except asyncio.CancelledError:
             pass
 
@@ -471,18 +459,21 @@ class X64DbgBridge:
                         await self._pipe_writer.drain()
                     except Exception:
                         self.state = ConnectionState.DISCONNECTED
-                        asyncio.create_task(self.reconnect())
+                        if self._reconnect_task is None or self._reconnect_task.done():
+                            self._reconnect_task = asyncio.create_task(self.reconnect())
                         break
                 elif self.protocol == BridgeProtocol.HTTP and self._http_session:
                     try:
                         async with self._http_session.get(f'{self.http_url}/status') as resp:
                             if resp.status != 200:
                                 self.state = ConnectionState.DISCONNECTED
-                                asyncio.create_task(self.reconnect())
+                                if self._reconnect_task is None or self._reconnect_task.done():
+                                    self._reconnect_task = asyncio.create_task(self.reconnect())
                                 break
                     except Exception:
                         self.state = ConnectionState.DISCONNECTED
-                        asyncio.create_task(self.reconnect())
+                        if self._reconnect_task is None or self._reconnect_task.done():
+                            self._reconnect_task = asyncio.create_task(self.reconnect())
                         break
         except asyncio.CancelledError:
             pass
@@ -639,18 +630,32 @@ class X64DbgBridge:
         })
         return "error" not in result
 
+    @staticmethod
+    def _coerce_int(value) -> Optional[int]:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            try:
+                return int(value, 16) if value.lower().startswith("0x") else int(value)
+            except ValueError:
+                return None
+        return None
+
     async def evaluate_expression(self, expression: str) -> Optional[int]:
         result = await self.send_command("eval", {"expression": expression})
-        return result.get("value") if "error" not in result else None
+        if "error" in result:
+            return None
+        return self._coerce_int(result.get("value_dec", result.get("value")))
 
     async def eval_expression(self, expr: str) -> dict:
-        """Evaluate an expression via the eval_expression plugin command.
-
-        Sends {"cmd": "eval_expression", "args": {"expression": expr}} through
-        the named pipe.  Returns the raw response dict — callers check for
-        "value" (numeric result) or "error" key.
-        """
-        return await self.send_command("eval_expression", {"expression": expr})
+        """Evaluate an expression. Aliases the plugin ``eval`` command."""
+        result = await self.send_command("eval", {"expression": expr})
+        coerced = self._coerce_int(result.get("value_dec", result.get("value")))
+        if coerced is not None:
+            result = dict(result)
+            result["value"] = coerced
+            result.setdefault("hex", hex(coerced))
+        return result
 
     async def execute_command(self, command: str) -> dict:
         """Execute a raw x64dbg command."""

@@ -1,24 +1,53 @@
 @echo off
-:: Build MCO x64dbg AI Agent Plugin
-:: Requires: MSVC (Visual Studio 2022) + x64dbg Plugin SDK
+:: Build ctxdebug x64dbg AI Agent Plugin
+:: Requires: MSVC + x64dbg Plugin SDK (bridgemain.h + x64dbg.lib)
 ::
-:: Download x64dbg SDK: https://github.com/x64dbg/x64dbg/tree/development/src/dbg
-:: Place pluginsdk/ folder next to this file.
+:: SDK search order:
+::   1. agent\plugins\pluginsdk\
+::   2. %X64DBG_SDK%  (folder that contains bridgemain.h)
+::   3. next to x64dbg.exe (%X64DBG_PATH%\..\..\pluginsdk)
 ::
-:: Output: mco_agent.dp64  (copy to x64dbg\x64\plugins\)
+:: Output: build\mco_agent.dp64  — copy to x64dbg\x64\plugins\
 
-setlocal
+setlocal EnableDelayedExpansion
 
 set PLUGIN_NAME=mco_agent
-set SDK_DIR=pluginsdk
-set OUT_DIR=build
+set PLUGIN_DIR=%~dp0
+set OUT_DIR=%PLUGIN_DIR%build
+set INCLUDE_ROOT=
 
-:: Find MSVC via vswhere
-for /f "delims=" %%i in ('"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2^>nul') do set VS_PATH=%%i
+if exist "%PLUGIN_DIR%pluginsdk\bridgemain.h" set INCLUDE_ROOT=%PLUGIN_DIR:~0,-1%
+if not defined INCLUDE_ROOT if defined X64DBG_SDK if exist "%X64DBG_SDK%\bridgemain.h" (
+    for %%I in ("%X64DBG_SDK%\..") do set INCLUDE_ROOT=%%~fI
+)
+if not defined INCLUDE_ROOT if defined X64DBG_PATH if exist "%X64DBG_PATH%" (
+    for %%I in ("%X64DBG_PATH%") do set _DBGDIR=%%~dpI
+    if exist "!_DBGDIR!..\..\pluginsdk\bridgemain.h" (
+        for %%I in ("!_DBGDIR!..\..") do set INCLUDE_ROOT=%%~fI
+    )
+)
+
+if not defined INCLUDE_ROOT (
+    echo [ERROR] x64dbg Plugin SDK not found.
+    echo Set X64DBG_SDK to the pluginsdk folder that contains bridgemain.h
+    echo or copy pluginsdk\ next to this script.
+    exit /b 1
+)
+
+echo [MCO] SDK root: %INCLUDE_ROOT%
+
+:: Find MSVC — include Preview editions, no component-id filter
+set VS_PATH=
+for /f "delims=" %%i in ('"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath 2^>nul') do set VS_PATH=%%i
+if not defined VS_PATH if exist "%ProgramFiles%\Microsoft Visual Studio\2022\Preview\VC\Auxiliary\Build\vcvars64.bat" (
+    set VS_PATH=%ProgramFiles%\Microsoft Visual Studio\2022\Preview
+)
+if not defined VS_PATH if exist "%ProgramFiles%\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" (
+    set VS_PATH=%ProgramFiles%\Microsoft Visual Studio\2022\Community
+)
 
 if not defined VS_PATH (
     echo [ERROR] Visual Studio with MSVC not found.
-    echo Install from: https://visualstudio.microsoft.com/vs/community/
     exit /b 1
 )
 
@@ -28,37 +57,30 @@ if not exist "%VCVARS%" (
     exit /b 1
 )
 
-:: Check SDK
-if not exist "%SDK_DIR%\bridgemain.h" (
-    echo [ERROR] x64dbg Plugin SDK not found at %SDK_DIR%\
-    echo.
-    echo Download the SDK:
-    echo   1. Get x64dbg source: https://github.com/x64dbg/x64dbg
-    echo   2. Copy src\dbg\pluginsdk\ here
-    echo   3. Copy x64dbg.lib from release\x64\ here
-    exit /b 1
-)
-
 if not exist "%OUT_DIR%" mkdir "%OUT_DIR%"
 
 echo [MCO] Setting up MSVC x64 environment...
 call "%VCVARS%" >nul 2>&1
 
 echo [MCO] Compiling x64dbg_plugin.cpp...
-cl /LD /EHsc /std:c++20 /O2 /W3 /nologo ^
-    /I"%SDK_DIR%" ^
+pushd "%PLUGIN_DIR%"
+cl /LD /EHsc /std:c++20 /O2 /W3 /nologo /D_CRT_SECURE_NO_WARNINGS ^
+    /I"%INCLUDE_ROOT%" ^
+    /I"%INCLUDE_ROOT%\pluginsdk" ^
     x64dbg_plugin.cpp ^
     /link ^
-    "%SDK_DIR%\x64dbg.lib" ^
+    "%INCLUDE_ROOT%\pluginsdk\x64dbg.lib" ^
+    "%INCLUDE_ROOT%\pluginsdk\x64bridge.lib" ^
     /OUT:"%OUT_DIR%\%PLUGIN_NAME%.dp64" ^
     /PDB:"%OUT_DIR%\%PLUGIN_NAME%.pdb" ^
     /MACHINE:X64 ^
-    /DLL ^
-    /NODEFAULTLIB:MSVCRT
+    /DLL
 
-if %ERRORLEVEL% neq 0 (
+set BUILD_ERR=%ERRORLEVEL%
+popd
+if %BUILD_ERR% neq 0 (
     echo [ERROR] Compilation failed!
-    exit /b %ERRORLEVEL%
+    exit /b %BUILD_ERR%
 )
 
 echo.
@@ -67,9 +89,5 @@ echo.
 echo Install:
 echo   copy "%OUT_DIR%\%PLUGIN_NAME%.dp64" "x64dbg\x64\plugins\"
 echo   Restart x64dbg — plugin loads automatically.
-echo.
-echo Verify:
-echo   In x64dbg log: [MCO] AI Agent plugin loaded
-echo   Then run:      python -m agent --mcp   (from mco\ directory)
 
 endlocal

@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+dist/
+*.egg
+
+# x64dbg SDK + compiler leftovers
+agent/plugins/pluginsdk/
+agent/plugins/build/
+agent/plugins/*.obj
+agent/plugins/*.exp
+agent/plugins/*.lib
+agent/plugins/*.pdb
+
+# IDA live-test artifacts
+tests/_sample_notepad.exe*
+tests/notepad.exe*
+tests/_ida_http.log
+tests/_ida_http_ready
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.idb
+*.i64

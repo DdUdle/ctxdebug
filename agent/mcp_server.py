@@ -1422,45 +1422,36 @@ Use search_strings to find interesting strings, then analyze surrounding code.""
     # ------------------------------------------------------------------
     async def run_stdio(self):
         """Run MCP server on stdin/stdout (stdio transport)."""
+        from mco_common import read_stdio_message, write_stdio_message
+
         self._running = True
         loop = asyncio.get_running_loop()
 
-        reader = asyncio.StreamReader()
-        protocol = asyncio.StreamReaderProtocol(reader)
-        await loop.connect_read_pipe(lambda: protocol, sys.stdin.buffer)
-
-        stdout = sys.stdout.buffer
-
         while self._running:
             try:
-                line = await reader.readline()
-                if not line:
+                raw, content_length = await loop.run_in_executor(None, read_stdio_message)
+                if raw is None:
                     break
-
-                line_str = line.decode('utf-8').strip()
-                if not line_str:
+                raw = raw.strip()
+                if not raw:
                     continue
 
-                message = json.loads(line_str)
+                message = json.loads(raw)
                 response = await self.handle_message(message)
 
                 if response:
-                    output = json.dumps(response).encode('utf-8') + b"\n"
-                    stdout.write(output)
-                    stdout.flush()
+                    write_stdio_message(response, content_length=content_length)
 
             except json.JSONDecodeError:
                 continue
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                error_response = {
+                write_stdio_message({
                     "jsonrpc": "2.0",
                     "id": None,
                     "error": {"code": -32603, "message": str(e)},
-                }
-                stdout.write(json.dumps(error_response).encode('utf-8') + b"\n")
-                stdout.flush()
+                })
 
 
 # ------------------------------------------------------------------

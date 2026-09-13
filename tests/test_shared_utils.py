@@ -5,7 +5,15 @@ import json
 import sys
 
 from agent.skills import parse_address, parse_int
-from mco_common import kv_block, section, serve_stdio, text_error, text_result
+from mco_common import (
+    kv_block,
+    read_stdio_message,
+    section,
+    serve_stdio,
+    text_error,
+    text_result,
+    write_stdio_message,
+)
 
 
 def test_parse_address():
@@ -90,3 +98,31 @@ def test_serve_stdio(monkeypatch, capsys):
     assert seen == [{"method": "quiet"}, {"method": "ping"}]
     # Only the non-None handler response is written out.
     assert capsys.readouterr().out == json.dumps({"echo": "ping"}) + "\n"
+
+
+def test_content_length_roundtrip(monkeypatch):
+    body = json.dumps({"method": "ping"}).encode("utf-8")
+    framed = b"Content-Length: %d\r\n\r\n" % len(body) + body
+
+    class _Stdin:
+        buffer = io.BytesIO(framed)
+
+    monkeypatch.setattr(sys, "stdin", _Stdin())
+
+    raw, used = read_stdio_message()
+    assert used is True
+    assert json.loads(raw) == {"method": "ping"}
+
+    out = io.BytesIO()
+
+    class _Stdout:
+        buffer = out
+        def write(self, *_a, **_k):
+            raise AssertionError("text stdout should not be used for Content-Length")
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(sys, "stdout", _Stdout())
+    write_stdio_message({"ok": True}, content_length=True)
+    dumped = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
+    assert out.getvalue() == b"Content-Length: %d\r\n\r\n" % len(dumped) + dumped

@@ -4,6 +4,21 @@ import ida_mcp
 import ida_server_plugin
 
 
+def test_plugin_import_does_not_bind_port():
+    assert ida_server_plugin._server_instance is None
+
+
+def test_md5_hex():
+    assert ida_server_plugin._md5_hex(None) == ""
+    assert ida_server_plugin._md5_hex(b"\xde\xad") == "dead"
+    assert ida_server_plugin._md5_hex("DEAD") == "DEAD"
+    assert ida_server_plugin._md5_hex("0xdead") == "dead"
+
+
+def test_on_ida_thread_runs_inline_without_ida():
+    assert ida_server_plugin._on_ida_thread(lambda: 7) == 7
+
+
 def test_loopback_detection():
     assert ida_server_plugin._is_loopback("127.0.0.1")
     assert ida_server_plugin._is_loopback("localhost")
