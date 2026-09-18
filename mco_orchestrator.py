@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""
+r"""
 MCO Orchestrator — Cross-Debugger Intelligence Layer
 Coordinates WinDbg, IDA Pro, and x64dbg for compound security workflows.
 
 Usage:
     python mco_orchestrator.py                    # stdio MCP server
-    claude mcp add mco -- python "C:\\path\\mco_orchestrator.py"
+    claude mcp add mco -- python "C:\path\mco_orchestrator.py"
 
 Environment:
     CDB_PATH        — path to cdb.exe (WinDbg headless)
