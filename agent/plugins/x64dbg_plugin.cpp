@@ -20,6 +20,7 @@
 #include <bcrypt.h>
 #include <sddl.h>
 #include <cstdint>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <string>
