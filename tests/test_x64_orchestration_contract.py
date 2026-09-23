@@ -92,6 +92,12 @@ def test_plugin_registers_all_orchestrator_p0_handlers():
 
     assert "hdr.version != PIPE_VERSION" in cpp
 
+    # modules.list / threads.list return arrays of objects. The previous
+    # single-`first` JsonBuilder emitted invalid JSON like `[{}{}]`.
+    assert "std::vector<Context> stack;" in cpp
+    assert "ctx.kind == ContainerKind::ARRAY" in cpp
+    assert "if (!ctx.first) s += ',';" in cpp
+
 
 def test_orchestrator_uses_shared_bridge_not_private_pipe_client():
     source = inspect.getsource(mco_orchestrator)
@@ -119,6 +125,15 @@ start             end                 module name
 def test_fault_ip_parser_handles_symbol_line_before_address():
     analyze = """
 FAULT_IP:
+sample!crash_here+0x16
+00007ff6`12123456 488b01          mov     rax,qword ptr [rcx]
+"""
+    assert mco_orchestrator._extract_crash_address(analyze) == 0x00007FF612123456
+
+
+def test_faulting_ip_parser_handles_standard_windbg_spelling():
+    analyze = """
+FAULTING_IP:
 sample!crash_here+0x16
 00007ff6`12123456 488b01          mov     rax,qword ptr [rcx]
 """
@@ -244,3 +259,62 @@ def test_pivot_to_ida_uses_explicit_runtime_base_for_aslr():
         "source": "explicit_runtime_module_base",
     }
     assert result["ida_address"] == hex(0x140000000 + expected_rva)
+
+
+def test_orchestrator_p0_workflows_call_shared_bridge_high_level_api():
+    calls = []
+
+    class FakeIda:
+        available = False
+
+    class FakeBridge:
+        pipe_name = r"\\.\pipe\test_x64dbg"
+
+        def __init__(self):
+            self.connected = True
+
+        async def connect(self):
+            calls.append("connect")
+            self.connected = True
+            return True
+
+        async def disconnect(self):
+            calls.append("disconnect")
+            self.connected = False
+
+        async def get_peb(self):
+            calls.append("get_peb")
+            return {"address": "0x1000", "being_debugged": 0}
+
+        async def get_registers(self):
+            calls.append("get_registers")
+            return {"rip": 0x401000}
+
+        async def get_modules(self):
+            calls.append("get_modules")
+            return [{"base": "0x400000", "size": 0x10000, "name": "sample.exe"}]
+
+        async def get_threads(self):
+            calls.append("get_threads")
+            return [{"tid": 1234}]
+
+    orchestrator = mco_orchestrator.MCOOrchestrator()
+    orchestrator.x64 = FakeBridge()
+    orchestrator.ida = FakeIda()
+    try:
+        bossix = orchestrator.bossix_report()
+        audit = orchestrator.quick_w_audit()
+    finally:
+        orchestrator.close()
+
+    assert bossix["x64dbg_dynamic"]["peb"]["address"] == "0x1000"
+    assert bossix["x64dbg_dynamic"]["registers"]["rip"] == 0x401000
+    assert audit["x64dbg_runtime"]["modules"][0]["name"] == "sample.exe"
+    assert audit["x64dbg_runtime"]["threads"][0]["tid"] == 1234
+    assert calls == [
+        "get_peb",
+        "get_registers",
+        "get_modules",
+        "get_threads",
+        "disconnect",
+    ]
