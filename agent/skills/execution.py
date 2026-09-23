@@ -216,45 +216,45 @@ def register_execution_skills(registry: SkillRegistry):
     skills = [
         SkillDefinition(
             name="run", description="Resume debugged process execution",
-            category="execution", execute=skill_run,
+            category="execution", effect="mutating", execute=skill_run,
         ),
         SkillDefinition(
             name="pause", description="Pause debugged process",
-            category="execution", execute=skill_pause,
+            category="execution", effect="idempotent", execute=skill_pause,
         ),
         SkillDefinition(
             name="step_into", description="Single step into (follow calls)",
-            category="execution", execute=skill_step_into,
+            category="execution", effect="mutating", execute=skill_step_into,
         ),
         SkillDefinition(
             name="step_over", description="Single step over (skip calls)",
-            category="execution", execute=skill_step_over,
+            category="execution", effect="mutating", execute=skill_step_over,
         ),
         SkillDefinition(
             name="step_n",
             description="Step N times and trace execution",
             args_schema={"count": "int (default 10)", "type": "'into' or 'over'"},
-            category="execution", execute=skill_step_n,
+            category="execution", effect="mutating", execute=skill_step_n,
         ),
         SkillDefinition(
             name="run_to",
             description="Run until specific address (temp breakpoint)",
             args_schema={"address": "int or hex string"},
-            category="execution", execute=skill_run_to,
+            category="execution", effect="mutating", execute=skill_run_to,
         ),
         SkillDefinition(
             name="get_registers", description="Get all CPU registers",
-            category="execution", execute=skill_get_registers,
+            category="execution", effect="read_only", execute=skill_get_registers,
         ),
         SkillDefinition(
             name="set_register", description="Set a CPU register to a value",
             args_schema={"register": "register name", "value": "int or hex string"},
-            category="execution", execute=skill_set_register,
+            category="execution", effect="idempotent", execute=skill_set_register,
         ),
         SkillDefinition(
             name="execute_command", description="Execute raw x64dbg command",
             args_schema={"command": "string"},
-            category="execution", execute=skill_execute_command,
+            category="execution", effect="mutating", execute=skill_execute_command,
         ),
     ]
     for s in skills:

@@ -379,50 +379,50 @@ def register_analysis_skills(registry: SkillRegistry):
         SkillDefinition(
             name="disassemble", description="Disassemble instructions at address with call/jump analysis",
             args_schema={"address": "int/hex (default: RIP)", "count": "int (default 30)"},
-            category="analysis", execute=skill_disassemble,
+            category="analysis", effect="read_only", execute=skill_disassemble,
         ),
         SkillDefinition(
             name="analyze_function", description="Deep function analysis — disasm, xrefs, API calls, patterns",
             args_schema={"address": "int/hex"},
-            category="analysis", execute=skill_analyze_function,
+            category="analysis", effect="idempotent", execute=skill_analyze_function,
         ),
         SkillDefinition(
             name="get_xrefs", description="Get cross-references to/from address",
             args_schema={"address": "int/hex", "direction": "'to' or 'from'"},
-            category="analysis", execute=skill_get_xrefs,
+            category="analysis", effect="read_only", execute=skill_get_xrefs,
         ),
         SkillDefinition(
             name="get_modules", description="List loaded modules with base addresses",
-            category="analysis", execute=skill_get_modules,
+            category="analysis", effect="read_only", execute=skill_get_modules,
         ),
         SkillDefinition(
             name="find_module", description="Find a module by name or resolve an address to module + RVA",
             args_schema={"query": "module name, path fragment, or address", "limit": "optional result limit"},
-            category="analysis", execute=skill_find_module,
+            category="analysis", effect="read_only", execute=skill_find_module,
         ),
         SkillDefinition(
             name="find_string", description="Find strings containing a case-insensitive query",
             args_schema={"query": "text fragment", "min_length": "minimum string length", "limit": "maximum matches"},
-            category="analysis", execute=skill_find_string,
+            category="analysis", effect="read_only", execute=skill_find_string,
         ),
         SkillDefinition(
             name="get_imports", description="Get import table (grouped by DLL)",
             args_schema={"module": "optional module name"},
-            category="analysis", execute=skill_get_imports,
+            category="analysis", effect="read_only", execute=skill_get_imports,
         ),
         SkillDefinition(
             name="get_exports", description="Get export table",
             args_schema={"module": "optional module name"},
-            category="analysis", execute=skill_get_exports,
+            category="analysis", effect="read_only", execute=skill_get_exports,
         ),
         SkillDefinition(
             name="get_call_stack", description="Get current call stack frames",
-            category="analysis", execute=skill_get_call_stack,
+            category="analysis", effect="read_only", execute=skill_get_call_stack,
         ),
         SkillDefinition(
             name="evaluate", description="Evaluate x64dbg expression",
             args_schema={"expression": "string"},
-            category="analysis", execute=skill_evaluate,
+            category="analysis", effect="read_only", execute=skill_evaluate,
         ),
     ]
     for s in skills:

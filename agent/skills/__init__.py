@@ -120,6 +120,15 @@ class SkillDefinition:
     args_schema: dict = field(default_factory=dict)
     category: str = "general"
     execute: Callable = None
+    effect: str = "mutating"
+
+    def __post_init__(self):
+        if self.effect not in {"read_only", "idempotent", "mutating"}:
+            raise ValueError(f"Invalid skill effect: {self.effect}")
+
+    @property
+    def retry_safe(self) -> bool:
+        return self.effect in {"read_only", "idempotent"}
 
 
 class SkillRegistry:

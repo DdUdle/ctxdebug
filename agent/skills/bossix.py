@@ -283,18 +283,18 @@ def register_bossix_skills(registry: SkillRegistry):
         SkillDefinition(
             name="scan_bossix",
             description="Scan binary for bossix techniques (PEB, API imports, patterns, RDTSC)",
-            category="bossix", execute=skill_scan_bossix,
+            category="bossix", effect="read_only", execute=skill_scan_bossix,
         ),
         SkillDefinition(
             name="hide_bossix",
             description="Hide debugger from detection (PEB patch, NtGlobalFlag, built-in hide)",
-            category="bossix", execute=skill_hide_bossix,
+            category="bossix", effect="mutating", execute=skill_hide_bossix,
         ),
         SkillDefinition(
             name="patch_bossix",
             description="Auto-patch bossix check at address (flip jumps, NOP calls)",
             args_schema={"address": "int/hex", "technique": "technique name"},
-            category="bossix", execute=skill_patch_bossix,
+            category="bossix", effect="mutating", execute=skill_patch_bossix,
         ),
     ]
     for s in skills:

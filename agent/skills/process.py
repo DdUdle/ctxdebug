@@ -183,29 +183,29 @@ def register_process_skills(registry: SkillRegistry):
     skills = [
         SkillDefinition(
             name="get_process_info", description="Get comprehensive process info (modules, threads, PEB)",
-            category="process", execute=skill_get_process_info,
+            category="process", effect="read_only", execute=skill_get_process_info,
         ),
         SkillDefinition(
             name="get_threads", description="List process threads",
-            category="process", execute=skill_get_threads,
+            category="process", effect="read_only", execute=skill_get_threads,
         ),
         SkillDefinition(
             name="get_peb_info", description="Get PEB info with anti-debug flag detection",
-            category="process", execute=skill_get_peb_info,
+            category="process", effect="read_only", execute=skill_get_peb_info,
         ),
         SkillDefinition(
             name="get_handles", description="List process handles (grouped by type)",
-            category="process", execute=skill_get_handles,
+            category="process", effect="read_only", execute=skill_get_handles,
         ),
         SkillDefinition(
             name="dump_module", description="Dump module to disk",
             args_schema={"module": "module name", "output": "output path"},
-            category="process", execute=skill_dump_module,
+            category="process", effect="mutating", execute=skill_dump_module,
         ),
         SkillDefinition(
             name="run_script", description="Execute x64dbg script commands",
             args_schema={"script": "script text"},
-            category="process", execute=skill_run_script,
+            category="process", effect="mutating", execute=skill_run_script,
         ),
     ]
     for s in skills:

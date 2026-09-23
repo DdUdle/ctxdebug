@@ -37,6 +37,7 @@ class Thought:
     action: Optional[str] = None
     action_args: Optional[dict] = None
     result: Optional[str] = None
+    skill_result: Optional[SkillResult] = field(default=None, repr=False)
     timestamp: float = field(default_factory=time.time)
 
 
@@ -147,7 +148,8 @@ class DebuggerAgent:
                 # 3. ACT — execute the chosen action
                 self.state = AgentState.ACTING
                 result = await self._act(thought)
-                thought.result = result
+                thought.skill_result = result
+                thought.result = result.to_string()
 
                 # 4. Update context based on result
                 self._update_context(thought)
@@ -295,6 +297,20 @@ Think step by step. Be precise with addresses (hex).
 
         Covers 10 major reverse engineering workflows.
         """
+        if self.context.thoughts:
+            previous = self.context.thoughts[-1]
+            if previous.skill_result is not None and not previous.skill_result.success:
+                return Thought(
+                    step=step,
+                    observation=observation,
+                    reasoning=(
+                        f"Previous action '{previous.action}' failed: "
+                        f"{previous.skill_result.summary}. "
+                        "Refusing to advance the heuristic plan blindly."
+                    ),
+                    action="__ask_user__",
+                )
+
         goal_lower = self.context.goal.lower()
 
         if step == 1 and not self.context.target_process:
@@ -525,48 +541,65 @@ Think step by step. Be precise with addresses (hex).
         ]
         return self._run_plan(step, observation, actions)
 
-    async def _act(self, thought: Thought) -> str:
-        """Execute an action via the skill registry."""
+    async def _act(self, thought: Thought) -> SkillResult:
+        """Execute an action, retrying only operations declared repeat-safe."""
         if not thought.action or thought.action.startswith("__"):
-            return ""
+            return SkillResult(success=True, summary="")
 
         skill = self.skills.get(thought.action)
         if not skill:
-            return f"Unknown skill: {thought.action}"
+            return SkillResult(
+                success=False,
+                summary=f"Unknown skill: {thought.action}",
+                error_code="UNKNOWN_SKILL",
+            )
 
-        for attempt in range(self.MAX_ACTION_RETRIES):
+        attempts = self.MAX_ACTION_RETRIES if skill.retry_safe else 1
+        for attempt in range(attempts):
             try:
-                result: SkillResult = await skill.execute(
+                return await skill.execute(
                     self.bridge,
                     self.context,
                     thought.action_args or {},
                 )
-                return result.to_string()
             except Exception as e:
-                if attempt == self.MAX_ACTION_RETRIES - 1:
-                    return f"Action failed after {self.MAX_ACTION_RETRIES} attempts: {e}"
+                if attempt == attempts - 1:
+                    return SkillResult(
+                        success=False,
+                        summary=f"Action '{thought.action}' failed: {e}",
+                        error_code="ACTION_EXCEPTION",
+                        error_hint=(
+                            "The operation was not retried because it is mutating."
+                            if not skill.retry_safe
+                            else f"Failed after {attempts} repeat-safe attempts."
+                        ),
+                    )
                 await self._async_sleep(0.5 * (attempt + 1))
 
-        return "Action failed"
+        return SkillResult(
+            success=False,
+            summary=f"Action '{thought.action}' failed",
+            error_code="ACTION_FAILED",
+        )
 
     def _update_context(self, thought: Thought):
-        """Update agent context based on action results."""
-        if not thought.result:
+        """Update context only from a structured successful SkillResult."""
+        if thought.skill_result is None or not thought.skill_result.success:
             return
 
-        result_lower = thought.result.lower()
         args = thought.action_args or {}
+        result_text = thought.result or thought.skill_result.to_string()
 
         if thought.action in ("analyze_function", "get_exports", "get_imports"):
-            self.memory.store_artifact("functions", thought.result)
+            self.memory.store_artifact("functions", result_text)
 
         if thought.action == "search_pattern":
             self.context.patterns_found.append({
                 "pattern": args.get("pattern", ""),
-                "results": thought.result[:500],
+                "results": result_text[:500],
             })
 
-        if thought.action in ("set_breakpoint", "set_hw_breakpoint", "bp_on_api_group") and "error" not in result_lower:
+        if thought.action in ("set_breakpoint", "set_hw_breakpoint", "bp_on_api_group"):
             bp_info = args.get("address", args.get("api", args.get("group", "")))
             if bp_info:
                 self.context.breakpoints.append(bp_info)
