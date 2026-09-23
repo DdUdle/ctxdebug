@@ -6,6 +6,8 @@ Windows debugger processes. Run them manually on the analysis workstation.
 Environment:
     MCO_LIVE_X64DBG=1
         x64dbg is open with the MCO plugin loaded and a target attached.
+        For the x64dbg -> IDA pivot test, IDA HTTP must have the same module
+        loaded as the module containing the current x64dbg RIP.
 
     MCO_LIVE_CRASH_DUMP=C:\\path\\to\\crash.dmp
         cdb.exe is installed, IDA HTTP is live with the matching binary loaded,
@@ -14,10 +16,9 @@ Environment:
 
 from __future__ import annotations
 
+import json
 import os
 import sys
-
-import json
 
 import pytest
 
