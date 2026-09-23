@@ -422,9 +422,9 @@ All MCP servers use **stdio JSON-RPC** (newline-delimited, MCP 2024-11-05 spec).
 The orchestrator's backend clients are lightweight wrappers — they do NOT spawn additional MCP server instances; they connect directly to cdb.exe, IDA HTTP, and the x64dbg pipe.
 
 ### x64dbg named-pipe protocol
-Binary framing: `MAGIC(4) + payload_len(uint32 LE) + padding(8) + JSON_payload`.
-Magic bytes: `X64A`. Defined in `bridge.py` (`X64DbgBridge`) and `x64dbg_plugin.cpp`.
-If you modify the framing in `bridge.py`, recompile `x64dbg_plugin.cpp`.
+Binary framing: `<4sHHII` = `magic(4) + version(uint16) + msg_type(uint16) + payload_len(uint32) + seq_id(uint32)`, followed by the JSON payload.
+Magic bytes: `X64A`; protocol version: `1`. The Python source of truth is `agent/x64_protocol.py`; `agent/bridge.py` imports it and the native `x64dbg_plugin.cpp` mirrors the ABI.
+If you modify the wire contract, update `agent/x64_protocol.py`, recompile `x64dbg_plugin.cpp`, and run `tests/test_x64_orchestration_contract.py`.
 
 ### IDA HTTP endpoint discovery
 `ida_mcp.py` (and the orchestrator's `IDAClient`) try 6 endpoint candidates on startup: `/api/v1/py`, `/api/v1/python`, `/api/python`, `/api/1/exec`, `/python`, `/exec`. First 200-response wins; result cached for the session.

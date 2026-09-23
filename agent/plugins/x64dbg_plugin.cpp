@@ -12,7 +12,7 @@
  *   Copy mco_agent.dp64 to x64dbg\x64\plugins\
  *   Restart x64dbg — plugin auto-loads and starts the pipe server.
  *
- * Protocol: see bridge.py — X64A magic, 16-byte header, JSON payload.
+ * Protocol: see agent/x64_protocol.py — X64A magic, 16-byte header, JSON payload.
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -58,7 +58,7 @@
 #pragma comment(lib, "pluginsdk/x64bridge.lib")
 
 // ============================================================================
-// Wire Protocol (must match bridge.py exactly)
+// Wire Protocol (must mirror agent/x64_protocol.py exactly)
 // ============================================================================
 #pragma pack(push, 1)
 struct PipeHeader {
@@ -88,35 +88,118 @@ constexpr wchar_t PIPE_NAME[] = L"\\\\.\\pipe\\x64dbg_ai_agent";
 // Minimal JSON builder (no external deps)
 // ============================================================================
 class JsonBuilder {
+    enum class ContainerKind { OBJECT, ARRAY };
+
+    struct Context {
+        ContainerKind kind;
+        bool first = true;
+        bool expecting_value = false;
+    };
+
     std::string s;
-    bool first = true;
+    std::vector<Context> stack;
+
 public:
-    JsonBuilder& begin_object() { s += '{'; first = true; return *this; }
-    JsonBuilder& end_object()   { s += '}'; first = false; return *this; }
-    JsonBuilder& begin_array()  { s += '['; first = true; return *this; }
-    JsonBuilder& end_array()    { s += ']'; first = false; return *this; }
+    JsonBuilder& begin_object() {
+        before_value();
+        s += '{';
+        stack.push_back({ContainerKind::OBJECT, true, false});
+        return *this;
+    }
+
+    JsonBuilder& end_object() {
+        s += '}';
+        if (!stack.empty()) stack.pop_back();
+        return *this;
+    }
+
+    JsonBuilder& begin_array() {
+        before_value();
+        s += '[';
+        stack.push_back({ContainerKind::ARRAY, true, false});
+        return *this;
+    }
+
+    JsonBuilder& end_array() {
+        s += ']';
+        if (!stack.empty()) stack.pop_back();
+        return *this;
+    }
 
     JsonBuilder& key(const std::string& k) {
-        if (!first) s += ',';
-        first = false;
+        if (stack.empty() || stack.back().kind != ContainerKind::OBJECT)
+            return *this;
+
+        Context& ctx = stack.back();
+        if (!ctx.first) s += ',';
+        ctx.first = false;
+        ctx.expecting_value = true;
+
         s += '"';
         s += escape(k);
         s += "\":";
         return *this;
     }
 
-    JsonBuilder& val(const std::string& v) { sep(); s += '"'; s += escape(v); s += '"'; return *this; }
-    JsonBuilder& val(const char* v)         { return val(std::string(v ? v : "")); }
-    JsonBuilder& val(uint64_t v)            { sep(); s += std::to_string(v); return *this; }
-    JsonBuilder& val(int64_t v)             { sep(); s += std::to_string(v); return *this; }
-    JsonBuilder& val(bool v)                { sep(); s += v ? "true" : "false"; return *this; }
-    JsonBuilder& raw(const std::string& r)  { sep(); s += r; return *this; }
-    JsonBuilder& null_val()                 { sep(); s += "null"; return *this; }
+    JsonBuilder& val(const std::string& v) {
+        before_value();
+        s += '"';
+        s += escape(v);
+        s += '"';
+        return *this;
+    }
+
+    JsonBuilder& val(const char* v) {
+        return val(std::string(v ? v : ""));
+    }
+
+    JsonBuilder& val(uint64_t v) {
+        before_value();
+        s += std::to_string(v);
+        return *this;
+    }
+
+    JsonBuilder& val(int64_t v) {
+        before_value();
+        s += std::to_string(v);
+        return *this;
+    }
+
+    JsonBuilder& val(bool v) {
+        before_value();
+        s += v ? "true" : "false";
+        return *this;
+    }
+
+    JsonBuilder& raw(const std::string& r) {
+        before_value();
+        s += r;
+        return *this;
+    }
+
+    JsonBuilder& null_val() {
+        before_value();
+        s += "null";
+        return *this;
+    }
 
     std::string str() const { return s; }
 
 private:
-    void sep() { if (!first && !s.empty() && s.back() != ':' && s.back() != '[' && s.back() != ',') s += ','; }
+    void before_value() {
+        if (stack.empty()) return;
+
+        Context& ctx = stack.back();
+        if (ctx.kind == ContainerKind::ARRAY) {
+            if (!ctx.first) s += ',';
+            ctx.first = false;
+            return;
+        }
+
+        // Object values follow a key and therefore never add their own comma.
+        if (ctx.expecting_value)
+            ctx.expecting_value = false;
+    }
 
     static std::string escape(const std::string& in) {
         std::string out;
@@ -912,6 +995,7 @@ static void handle_client(HANDLE pipe) {
         PipeHeader hdr;
         if (!read_exact(pipe, &hdr, sizeof(hdr))) break;
         if (memcmp(hdr.magic, PIPE_MAGIC, 4) != 0) break;
+        if (hdr.version != PIPE_VERSION) break;
         if (hdr.payload_len > 64u * 1024u * 1024u) break;
 
         std::string payload(hdr.payload_len, '\0');

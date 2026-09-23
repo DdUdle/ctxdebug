@@ -18,7 +18,6 @@ import asyncio
 import json
 import logging
 import os
-import struct
 import subprocess
 import sys
 import time
@@ -27,6 +26,7 @@ import urllib.error
 from contextlib import contextmanager
 from typing import Any
 
+from agent.bridge import X64DbgBridge
 from mco_common import serve_stdio, text_error, text_result
 
 logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
@@ -154,45 +154,153 @@ class IDAClient:
             return f"ERROR: {e}"
 
 
-class X64DbgClient:
-    """Minimal x64dbg named-pipe client for orchestrator use."""
-
-    PIPE_NAME = os.environ.get("X64DBG_PIPE", r"\\.\pipe\x64dbg_ai_agent")
-    MAGIC = b"X64A"
-    MAX_RESPONSE_BYTES = 64 * 1024 * 1024
-
-    def available(self) -> bool:
-        return os.path.exists(self.PIPE_NAME)
-
-    def send_command(self, cmd: str, args: dict | None = None) -> dict:
-        if not self.available():
-            return {"error": "x64dbg plugin not running (pipe not found)"}
-        payload = json.dumps({"cmd": cmd, "args": args or {}}).encode()
-        header = self.MAGIC + struct.pack("<I", len(payload)) + b"\x00" * 8
-        try:
-            with open(self.PIPE_NAME, "r+b", buffering=0) as pipe:
-                pipe.write(header + payload)
-                resp_header = pipe.read(16)
-                if len(resp_header) < 16:
-                    return {"error": "Incomplete response header"}
-                resp_len = struct.unpack("<I", resp_header[4:8])[0]
-                if resp_len > self.MAX_RESPONSE_BYTES:
-                    return {"error": f"Response too large: {resp_len} bytes"}
-                resp_data = pipe.read(resp_len)
-                return json.loads(resp_data.decode())
-        except Exception as e:
-            return {"error": str(e)}
-
-
 # ─────────────────────────────────────────────────────────────
 #  Orchestrator
 # ─────────────────────────────────────────────────────────────
+
+def _parse_hex_token(token: str) -> int | None:
+    cleaned = token.strip().strip(",;:()[]{}").replace("`", "")
+    if cleaned.lower().startswith("0x"):
+        cleaned = cleaned[2:]
+    if not cleaned or any(ch not in "0123456789abcdefABCDEF" for ch in cleaned):
+        return None
+    try:
+        return int(cleaned, 16)
+    except ValueError:
+        return None
+
+
+def _extract_crash_address(analyze_output: str) -> int | None:
+    """Extract the faulting runtime address from common WinDbg !analyze output."""
+    lines = analyze_output.splitlines()
+    markers = ("FAULT_IP:", "FAULTING_IP:", "ExceptionAddress:")
+    for index, line in enumerate(lines):
+        if not any(marker in line for marker in markers):
+            continue
+        candidates = line.split()
+        for nearby in lines[index + 1:index + 4]:
+            candidates.extend(nearby.split())
+        for token in candidates:
+            value = _parse_hex_token(token)
+            if value is not None and value > 0xFFFF:
+                return value
+    return None
+
+
+def _extract_module_info(lm_output: str, address: int | None = None) -> dict | None:
+    """Parse module bounds/name from WinDbg `lm a <address>` output."""
+    for line in lm_output.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        start = _parse_hex_token(parts[0])
+        end = _parse_hex_token(parts[1])
+        if start is None or end is None or end <= start:
+            continue
+        if address is not None and not (start <= address < end):
+            continue
+        return {
+            "base": start,
+            "end": end,
+            "name": parts[2],
+        }
+    return None
+
+
+def _extract_module_base(lm_output: str, address: int | None = None) -> int | None:
+    """Compatibility helper returning only the WinDbg runtime module base."""
+    info = _extract_module_info(lm_output, address)
+    return info["base"] if info else None
+
+
+def _runtime_to_rva(runtime_address: int, runtime_module_base: int) -> int:
+    if runtime_module_base < 0 or runtime_address < runtime_module_base:
+        raise ValueError("Runtime address is below module base")
+    return runtime_address - runtime_module_base
+
+
+def _find_runtime_module(modules: list[dict], address: int) -> dict | None:
+    """Find the runtime module containing an address from x64dbg modules.list."""
+    for module in modules:
+        base_raw = module.get("base")
+        size_raw = module.get("size", 0)
+        try:
+            base = int(base_raw, 16) if isinstance(base_raw, str) else int(base_raw)
+            size = int(size_raw, 0) if isinstance(size_raw, str) else int(size_raw)
+        except (TypeError, ValueError):
+            continue
+        if size > 0 and base <= address < base + size:
+            return {**module, "_base_int": base}
+    return None
+
 
 class MCOOrchestrator:
     def __init__(self):
         self.cdb = CdbClient()
         self.ida = IDAClient()
-        self.x64 = X64DbgClient()
+        pipe_name = os.environ.get("X64DBG_PIPE") or X64DbgBridge.PIPE_NAME
+        self.x64 = X64DbgBridge(pipe_name=pipe_name)
+        self._async_runner = asyncio.Runner()
+
+    def close(self):
+        try:
+            if self.x64.connected:
+                self._async_runner.run(self.x64.disconnect())
+        finally:
+            self._async_runner.close()
+
+    def _run_async(self, awaitable):
+        return self._async_runner.run(awaitable)
+
+    async def _ensure_x64(self) -> bool:
+        return self.x64.connected or await self.x64.connect()
+
+    def _x64_available(self) -> bool:
+        return bool(self._run_async(self._ensure_x64()))
+
+    def _x64_bossix_snapshot(self) -> dict:
+        async def collect():
+            if not await self._ensure_x64():
+                return {"error": "x64dbg plugin not running"}
+
+            peb = await self.x64.get_peb()
+            registers = await self.x64.get_registers()
+            snapshot = {"peb": peb, "registers": registers}
+
+            if isinstance(peb, dict) and peb.get("error"):
+                return {**snapshot, "error": f"process.peb failed: {peb['error']}"}
+            if registers is None:
+                return {**snapshot, "error": "registers.get_all failed"}
+
+            return snapshot
+
+        return self._run_async(collect())
+
+    def _x64_modules_snapshot(self) -> dict:
+        async def collect():
+            if not await self._ensure_x64():
+                return {"error": "x64dbg plugin not running"}
+            return {"modules": await self.x64.get_modules()}
+
+        return self._run_async(collect())
+
+    def _x64_runtime_snapshot(self) -> dict:
+        async def collect():
+            if not await self._ensure_x64():
+                return {"error": "x64dbg plugin not running"}
+
+            modules = await self.x64.get_modules()
+            threads = await self.x64.get_threads()
+            snapshot = {"modules": modules, "threads": threads}
+
+            if not modules:
+                return {**snapshot, "error": "modules.list returned no modules"}
+            if not threads:
+                return {**snapshot, "error": "threads.list returned no threads"}
+
+            return snapshot
+
+        return self._run_async(collect())
 
     # ── Status ───────────────────────────────────────────────
 
@@ -200,7 +308,7 @@ class MCOOrchestrator:
         """Check which debuggers are available right now."""
         windbg_ok = os.path.exists(self.cdb.DEFAULT_CDB)
         ida_ok = self.ida.available
-        x64_ok = self.x64.available()
+        x64_ok = self._x64_available()
         return {
             "windbg": {
                 "available": windbg_ok,
@@ -215,7 +323,7 @@ class MCOOrchestrator:
             },
             "x64dbg": {
                 "available": x64_ok,
-                "pipe": self.x64.PIPE_NAME,
+                "pipe": self.x64.pipe_name,
                 "status": "plugin active" if x64_ok else "plugin not loaded"
             },
             "active_count": sum([windbg_ok, ida_ok, x64_ok])
@@ -242,53 +350,85 @@ class MCOOrchestrator:
         analyze = self.cdb.run("!analyze -v", timeout=60)
         result["stages"].append({"stage": "windbg_analyze", "output": analyze[-3000:]})
 
-        # Extract crashing address from !analyze output
-        crash_addr = None
-        for line in analyze.splitlines():
-            if "FAULT_IP:" in line or "ExceptionAddress:" in line:
-                parts = line.split()
-                for p in parts:
-                    if p.startswith("0x") or (len(p) == 16 and all(c in "0123456789abcdefABCDEF" for c in p)):
-                        try:
-                            crash_addr = int(p.replace("0x", ""), 16)
-                            break
-                        except ValueError:
-                            pass
-                if crash_addr:
-                    break
-
+        # Extract runtime fault address, then normalize through RVA before IDA.
+        crash_addr = _extract_crash_address(analyze)
         result["crash_address"] = hex(crash_addr) if crash_addr else None
 
-        # Stage 2: IDA decompile of crashing function
-        if crash_addr and self.ida.available:
+        runtime_base = None
+        runtime_module = None
+        rva = None
+        if crash_addr:
+            lm_out = self.cdb.run(f"lm a {crash_addr:#x}", timeout=10)
+            result["stages"].append({"stage": "windbg_module_lookup", "output": lm_out[-1500:]})
+            module_info = _extract_module_info(lm_out, crash_addr)
+            if module_info:
+                runtime_base = module_info["base"]
+                runtime_module = module_info["name"]
+                rva = _runtime_to_rva(crash_addr, runtime_base)
+
+        result["address_normalization"] = {
+            "runtime_address": hex(crash_addr) if crash_addr is not None else None,
+            "runtime_module_base": hex(runtime_base) if runtime_base is not None else None,
+            "runtime_module": runtime_module,
+            "rva": hex(rva) if rva is not None else None,
+        }
+
+        # Stage 2: IDA decompile using IDA imagebase + runtime RVA.
+        if rva is not None and self.ida.available:
             ida_code = f"""
+import os
 import idc, idaapi, idautils
 
-addr = {crash_addr}
-func = idaapi.get_func(addr)
-func_addr = func.start_ea if func else addr
+runtime_address = {crash_addr}
+runtime_module_base = {runtime_base}
+runtime_module = {json.dumps(runtime_module)}
+rva = {rva}
+ida_imagebase = idaapi.get_imagebase()
+ida_root = idc.get_root_filename() or ''
+runtime_stem = os.path.splitext(os.path.basename(runtime_module or ''))[0].lower()
+ida_stem = os.path.splitext(os.path.basename(ida_root))[0].lower()
 
-# Decompile
-try:
-    cfunc = idaapi.decompile(func_addr)
-    decompiled = str(cfunc) if cfunc else 'Decompilation failed'
-except Exception as e:
-    decompiled = f'Error: {{e}}'
+if runtime_stem and ida_stem and runtime_stem != ida_stem:
+    print(json.dumps({{
+        'error': 'ida_module_mismatch',
+        'runtime_module': runtime_module,
+        'ida_root_filename': ida_root,
+        'runtime_address': hex(runtime_address),
+        'rva': hex(rva),
+    }}))
+else:
+    addr = ida_imagebase + rva
+    func = idaapi.get_func(addr)
+    func_addr = func.start_ea if func else addr
 
-# Function info
-func_name = idc.get_func_name(func_addr) or 'unknown'
-func_size = (func.end_ea - func.start_ea) if func else 0
+    # Decompile
+    try:
+        cfunc = idaapi.decompile(func_addr)
+        decompiled = str(cfunc) if cfunc else 'Decompilation failed'
+    except Exception as e:
+        decompiled = f'Error: {{e}}'
 
-# Callers
-callers = [hex(r.frm) for r in idautils.XrefsTo(func_addr, 0)][:10]
+    # Function info
+    func_name = idc.get_func_name(func_addr) or 'unknown'
+    func_size = (func.end_ea - func.start_ea) if func else 0
 
-print(json.dumps({{
-    'function': func_name,
-    'address': hex(func_addr),
-    'size': func_size,
-    'callers': callers,
-    'decompiled': decompiled[:3000]
-}}))
+    # Callers
+    callers = [hex(r.frm) for r in idautils.XrefsTo(func_addr, 0)][:10]
+
+    print(json.dumps({{
+        'function': func_name,
+        'runtime_address': hex(runtime_address),
+        'runtime_module_base': hex(runtime_module_base),
+        'runtime_module': runtime_module,
+        'ida_root_filename': ida_root,
+        'rva': hex(rva),
+        'ida_imagebase': hex(ida_imagebase),
+        'ida_address': hex(addr),
+        'function_address': hex(func_addr),
+        'size': func_size,
+        'callers': callers,
+        'decompiled': decompiled[:3000]
+    }}))
 """.strip()
             ida_result = self.ida.exec_python(
                 "import json\n" + ida_code
@@ -297,12 +437,16 @@ print(json.dumps({{
                 result["ida_analysis"] = json.loads(ida_result.strip().split("\n")[-1])
             except Exception:
                 result["ida_analysis"] = {"raw": ida_result[:2000]}
-            result["stages"].append({"stage": "ida_decompile", "status": "ok"})
+            ida_status = result["ida_analysis"].get("error", "ok")
+            result["stages"].append({"stage": "ida_decompile", "status": ida_status})
         else:
-            result["stages"].append({
-                "stage": "ida_decompile",
-                "status": "skipped" if not crash_addr else "ida_not_available"
-            })
+            if not crash_addr:
+                status = "fault_address_unresolved"
+            elif rva is None:
+                status = "runtime_module_base_unresolved"
+            else:
+                status = "ida_not_available"
+            result["stages"].append({"stage": "ida_decompile", "status": status})
 
         self.cdb.close()
         return result
@@ -351,73 +495,131 @@ print(json.dumps({'bossix_hits': hits, 'total': len(hits)}))
         else:
             result["ida_static"] = {"status": "IDA not available"}
 
-        # x64dbg PEB check
-        if self.x64.available():
-            peb = self.x64.send_command("get_peb")
-            regs = self.x64.send_command("get_registers")
+        # x64dbg dynamic snapshot through the shared bridge client.
+        x64_snapshot = self._x64_bossix_snapshot()
+        if "error" not in x64_snapshot:
             result["x64dbg_dynamic"] = {
-                "peb": peb,
-                "registers": regs,
+                **x64_snapshot,
                 "hint": "Use bossix_hide to patch PEB.BeingDebugged"
             }
         else:
-            result["x64dbg_dynamic"] = {"status": "x64dbg not attached"}
+            result["x64dbg_dynamic"] = {"status": "x64dbg not attached", **x64_snapshot}
 
         return result
 
     # ── Cross-Debugger Workflow 3: Pivot Address ────────────
 
-    def pivot_to_ida(self, address: str, context: str = "") -> dict:
+    def pivot_to_ida(
+        self,
+        address: str,
+        context: str = "",
+        runtime_module_base: str = "",
+    ) -> dict:
         """
-        Take an address from WinDbg/x64dbg and analyze it in IDA.
-        address: hex address (e.g. "0x7FF712340000")
-        context: optional context from WinDbg (e.g. !analyze output)
+        Normalize a runtime address through RVA before analyzing it in IDA.
+
+        If runtime_module_base is omitted, the orchestrator tries to resolve the
+        containing module from the live x64dbg modules list. If normalization is
+        unavailable, the address is only accepted when it is already mapped in
+        the current IDA database.
         """
         try:
-            addr_int = int(address, 16) if address.startswith("0x") else int(address, 16)
-        except ValueError:
+            addr_int = int(address, 16)
+        except (TypeError, ValueError):
             return {"error": f"Invalid address: {address}"}
 
         if not self.ida.available:
             return {"error": "IDA Pro not available"}
 
+        runtime_base = None
+        module_name = None
+        normalization_source = None
+
+        if runtime_module_base:
+            try:
+                runtime_base = int(runtime_module_base, 16)
+                normalization_source = "explicit_runtime_module_base"
+            except (TypeError, ValueError):
+                return {"error": f"Invalid runtime_module_base: {runtime_module_base}"}
+        else:
+            x64_snapshot = self._x64_modules_snapshot()
+            if "error" not in x64_snapshot:
+                module = _find_runtime_module(x64_snapshot.get("modules", []), addr_int)
+                if module:
+                    runtime_base = module["_base_int"]
+                    module_name = module.get("name")
+                    normalization_source = "x64dbg_modules"
+
+        rva = _runtime_to_rva(addr_int, runtime_base) if runtime_base is not None else None
+        rva_literal = "None" if rva is None else str(rva)
+        module_literal = repr(module_name)
+
         code = f"""
-import idc, idaapi, idautils, json
+import os
+import idc, idaapi, idautils, ida_segment, json
 
-addr = {addr_int}
-func = idaapi.get_func(addr)
-func_start = func.start_ea if func else addr
+input_addr = {addr_int}
+rva = {rva_literal}
+runtime_module = {module_literal}
+ida_imagebase = idaapi.get_imagebase()
+ida_root = idc.get_root_filename() or ''
+runtime_stem = os.path.splitext(os.path.basename(runtime_module or ''))[0].lower()
+ida_stem = os.path.splitext(os.path.basename(ida_root))[0].lower()
 
-result = {{
-    'address': hex(addr),
-    'function_start': hex(func_start),
-    'function_name': idc.get_func_name(func_start) or 'sub_{{:X}}'.format(func_start),
-    'module': idc.get_segm_name(func_start),
-    'flags': idc.get_full_flags(addr),
-}}
+if rva is not None and runtime_stem and ida_stem and runtime_stem != ida_stem:
+    print(json.dumps({{
+        'error': 'ida_module_mismatch',
+        'runtime_module': runtime_module,
+        'ida_root_filename': ida_root,
+        'input_address': hex(input_addr),
+        'rva': hex(rva),
+    }}))
+else:
+    addr = ida_imagebase + rva if rva is not None else input_addr
+    segment = ida_segment.getseg(addr)
 
-# Decompile
-try:
-    cfunc = idaapi.decompile(func_start)
-    result['pseudocode'] = str(cfunc)[:4000] if cfunc else None
-except Exception as e:
-    result['pseudocode'] = None
-    result['decompile_error'] = str(e)
+    if segment is None:
+        print(json.dumps({{
+            'error': 'address_not_mapped_in_ida',
+            'input_address': hex(input_addr),
+            'rva': hex(rva) if rva is not None else None,
+            'ida_imagebase': hex(ida_imagebase),
+            'candidate_ida_address': hex(addr),
+        }}))
+    else:
+        func = idaapi.get_func(addr)
+        func_start = func.start_ea if func else addr
 
-# Xrefs to this address
-result['xrefs_to'] = [hex(r.frm) for r in idautils.XrefsTo(addr, 0)][:15]
+        result = {{
+            'input_address': hex(input_addr),
+            'rva': hex(rva) if rva is not None else None,
+            'ida_imagebase': hex(ida_imagebase),
+            'ida_root_filename': ida_root,
+            'ida_address': hex(addr),
+            'function_start': hex(func_start),
+            'function_name': idc.get_func_name(func_start) or 'sub_{{:X}}'.format(func_start),
+            'module': idc.get_segm_name(func_start),
+            'flags': idc.get_full_flags(addr),
+        }}
 
-# Xrefs from this function
-result['calls_out'] = []
-if func:
-    for head in idautils.Heads(func_start, func.end_ea):
-        if idc.is_call_insn(head):
-            target = idc.get_operand_value(head, 0)
-            name = idc.get_func_name(target)
-            if name:
-                result['calls_out'].append({{'from': hex(head), 'to': name}})
+        try:
+            cfunc = idaapi.decompile(func_start)
+            result['pseudocode'] = str(cfunc)[:4000] if cfunc else None
+        except Exception as e:
+            result['pseudocode'] = None
+            result['decompile_error'] = str(e)
 
-print(json.dumps(result))
+        result['xrefs_to'] = [hex(r.frm) for r in idautils.XrefsTo(addr, 0)][:15]
+        result['calls_out'] = []
+        if func:
+            for head in idautils.Heads(func_start, func.end_ea):
+                if idc.is_call_insn(head):
+                    target = idc.get_operand_value(head, 0)
+                    name = idc.get_func_name(target)
+                    if name:
+                        result['calls_out'].append({{'from': hex(head), 'to': name}})
+
+        print(json.dumps(result))
 """
         raw = self.ida.exec_python(code)
         try:
@@ -425,6 +627,13 @@ print(json.dumps(result))
         except Exception:
             parsed = {"raw": raw[:2000]}
 
+        parsed["address_normalization"] = {
+            "runtime_address": hex(addr_int),
+            "runtime_module_base": hex(runtime_base) if runtime_base is not None else None,
+            "rva": hex(rva) if rva is not None else None,
+            "runtime_module": module_name,
+            "source": normalization_source or "already_mapped_ida_address",
+        }
         if context:
             parsed["context_from_windbg"] = context[:500]
 
@@ -502,15 +711,11 @@ print(json.dumps(summary))
         else:
             report["ida_audit"] = {"status": "IDA not available"}
 
-        if self.x64.available():
-            modules = self.x64.send_command("list_modules")
-            threads = self.x64.send_command("list_threads")
-            report["x64dbg_runtime"] = {
-                "modules": modules,
-                "threads": threads
-            }
+        x64_snapshot = self._x64_runtime_snapshot()
+        if "error" not in x64_snapshot:
+            report["x64dbg_runtime"] = x64_snapshot
         else:
-            report["x64dbg_runtime"] = {"status": "x64dbg not attached"}
+            report["x64dbg_runtime"] = {"status": "x64dbg not attached", **x64_snapshot}
 
         report["recommendation"] = (
             "HIGH RISK: Multiple suspicious indicators found. Recommend sandbox analysis."
@@ -694,6 +899,10 @@ class MCPServer:
                         "context": {
                             "type": "string",
                             "description": "Optional context string (e.g. WinDbg output about this address)"
+                        },
+                        "runtime_module_base": {
+                            "type": "string",
+                            "description": "Optional runtime module base for ASLR-safe RVA normalization, e.g. '0x7FF712000000'"
                         }
                     },
                     "required": ["address"]
@@ -789,7 +998,9 @@ class MCPServer:
                     result = self._ok(self.orchestrator.bossix_report())
                 elif tool == "mco_pivot_to_ida":
                     result = self._ok(self.orchestrator.pivot_to_ida(
-                        args["address"], args.get("context", "")
+                        args["address"],
+                        args.get("context", ""),
+                        args.get("runtime_module_base", ""),
                     ))
                 elif tool == "mco_w_audit":
                     result = self._ok(self.orchestrator.quick_w_audit())
@@ -814,7 +1025,10 @@ class MCPServer:
 
 def main():
     server = MCPServer()
-    serve_stdio(server.handle)
+    try:
+        serve_stdio(server.handle)
+    finally:
+        server.orchestrator.close()
 
 
 if __name__ == "__main__":

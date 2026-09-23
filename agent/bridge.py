@@ -13,11 +13,19 @@ Key improvements over existing MCP bridges:
 import asyncio
 import json
 import os
-import struct
 import time
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, Callable, Optional
+
+from .x64_protocol import (
+    MAX_PAYLOAD_BYTES,
+    PIPE_MAGIC,
+    PIPE_VERSION,
+    MsgType,
+    PipeHeader,
+    PipeMessage,
+)
 
 
 def _default_socket_path() -> str:
@@ -40,60 +48,6 @@ class BridgeProtocol(IntEnum):
     NAMED_PIPE = 0
     HTTP = 1
     SHARED_MEMORY = 2  # Future: fastest for local
-
-
-# ------------------------------------------------------------------
-# Wire protocol for Named Pipes
-# ------------------------------------------------------------------
-# Header: [magic(4)] [version(2)] [msg_type(2)] [payload_len(4)] [seq_id(4)]
-# Payload: JSON-encoded command/response
-
-PIPE_MAGIC = b'X64A'
-PIPE_VERSION = 1
-MAX_PAYLOAD_BYTES = 64 * 1024 * 1024
-
-class MsgType(IntEnum):
-    COMMAND = 0x01
-    RESPONSE = 0x02
-    EVENT = 0x03
-    HEARTBEAT = 0x04
-    ACK = 0x05
-    ERROR = 0xFF
-
-
-@dataclass
-class PipeMessage:
-    msg_type: MsgType
-    seq_id: int
-    payload: dict
-
-    HEADER_SIZE = 16  # 4 + 2 + 2 + 4 + 4
-
-    def pack(self) -> bytes:
-        payload_bytes = json.dumps(self.payload).encode('utf-8')
-        header = struct.pack('<4sHHII',
-            PIPE_MAGIC,
-            PIPE_VERSION,
-            self.msg_type,
-            len(payload_bytes),
-            self.seq_id,
-        )
-        return header + payload_bytes
-
-    @classmethod
-    def unpack(cls, data: bytes) -> 'PipeMessage':
-        if len(data) < cls.HEADER_SIZE:
-            raise ValueError("Incomplete message header")
-        magic, version, msg_type, payload_len, seq_id = struct.unpack(
-            '<4sHHII', data[:cls.HEADER_SIZE]
-        )
-        if magic != PIPE_MAGIC:
-            raise ValueError(f"Invalid magic: {magic}")
-        if payload_len > MAX_PAYLOAD_BYTES:
-            raise ValueError(f"Payload too large: {payload_len} bytes")
-        payload_bytes = data[cls.HEADER_SIZE:cls.HEADER_SIZE + payload_len]
-        payload = json.loads(payload_bytes) if payload_bytes else {}
-        return cls(msg_type=MsgType(msg_type), seq_id=seq_id, payload=payload)
 
 
 # ------------------------------------------------------------------
@@ -412,14 +366,12 @@ class X64DbgBridge:
         """Read responses from Named Pipe."""
         try:
             while self.connected:
-                header = await self._pipe_reader.readexactly(PipeMessage.HEADER_SIZE)
-                _, _, _, payload_len, _ = struct.unpack('<4sHHII', header)
-                if payload_len > MAX_PAYLOAD_BYTES:
-                    raise ValueError(f"Payload too large: {payload_len} bytes")
-                payload = await self._pipe_reader.readexactly(payload_len)
-                data = header + payload
-
-                msg = PipeMessage.unpack(data)
+                header_bytes = await self._pipe_reader.readexactly(PipeMessage.HEADER_SIZE)
+                header = PipeHeader.unpack(header_bytes)
+                if header.payload_len > MAX_PAYLOAD_BYTES:
+                    raise ValueError(f"Payload too large: {header.payload_len} bytes")
+                payload = await self._pipe_reader.readexactly(header.payload_len)
+                msg = PipeMessage.unpack(header_bytes + payload)
 
                 if msg.msg_type == MsgType.RESPONSE:
                     pending = self._pending.pop(msg.seq_id, None)
@@ -446,6 +398,10 @@ class X64DbgBridge:
                 self._reconnect_task = asyncio.create_task(self.reconnect())
         except asyncio.CancelledError:
             pass
+        except Exception:
+            self.state = ConnectionState.DISCONNECTED
+            if self._reconnect_task is None or self._reconnect_task.done():
+                self._reconnect_task = asyncio.create_task(self.reconnect())
 
     async def _heartbeat_loop(self):
         """Send periodic heartbeats. Triggers reconnect on pipe failure."""
