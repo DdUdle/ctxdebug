@@ -507,6 +507,43 @@ def test_mcp_boundary_exposes_p0_x64dbg_workflows():
     assert audit["x64dbg_runtime"]["threads"][0]["tid"] == 1234
 
 
+def test_orchestrator_does_not_false_green_failed_x64dbg_snapshots():
+    class FakeBridge:
+        pipe_name = r"\\.\pipe\test_x64dbg"
+
+        def __init__(self):
+            self.connected = True
+
+        async def connect(self):
+            return True
+
+        async def disconnect(self):
+            self.connected = False
+
+        async def get_peb(self):
+            return {"error": "no debuggee"}
+
+        async def get_registers(self):
+            return None
+
+        async def get_modules(self):
+            return []
+
+        async def get_threads(self):
+            return []
+
+    orchestrator = mco_orchestrator.MCOOrchestrator()
+    orchestrator.x64 = FakeBridge()
+    try:
+        bossix = orchestrator._x64_bossix_snapshot()
+        runtime = orchestrator._x64_runtime_snapshot()
+    finally:
+        orchestrator.close()
+
+    assert bossix["error"].startswith("process.peb failed:")
+    assert runtime["error"] == "modules.list returned no modules"
+
+
 def test_orchestrator_p0_workflows_call_shared_bridge_high_level_api():
     calls = []
 
