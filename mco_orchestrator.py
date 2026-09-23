@@ -537,7 +537,7 @@ print(json.dumps({'bossix_hits': hits, 'total': len(hits)}))
 
         rva = _runtime_to_rva(addr_int, runtime_base) if runtime_base is not None else None
         rva_literal = "None" if rva is None else str(rva)
-        module_literal = json.dumps(module_name)
+        module_literal = repr(module_name)
 
         code = f"""
 import os
