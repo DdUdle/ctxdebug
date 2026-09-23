@@ -15,9 +15,12 @@ Environment:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import re
+import struct
 import subprocess
 import sys
 import time
@@ -121,6 +124,194 @@ def _find_runtime_module(modules: list[dict], address: int) -> dict | None:
     return None
 
 
+def _coerce_int(value) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return int(text, 0)
+        except ValueError:
+            try:
+                return int(text, 16)
+            except ValueError:
+                return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _file_hash(path: str, algorithm: str) -> str | None:
+    if not path or not os.path.isfile(path):
+        return None
+    digest = hashlib.new(algorithm)
+    try:
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _pe_file_identity(path: str) -> dict:
+    identity = {
+        "path": path or None,
+        "sha256": None,
+        "md5": None,
+        "pe_timestamp": None,
+        "image_size": None,
+    }
+    if not path or not os.path.isfile(path):
+        return identity
+
+    identity["sha256"] = _file_hash(path, "sha256")
+    identity["md5"] = _file_hash(path, "md5")
+    try:
+        with open(path, "rb") as fh:
+            dos = fh.read(0x40)
+            if len(dos) < 0x40 or dos[:2] != b"MZ":
+                return identity
+            pe_offset = struct.unpack_from("<I", dos, 0x3C)[0]
+            fh.seek(pe_offset)
+            header = fh.read(24 + 64)
+            if len(header) < 24 + 60 or header[:4] != b"PE\\x00\\x00":
+                return identity
+            identity["pe_timestamp"] = struct.unpack_from("<I", header, 8)[0]
+            identity["image_size"] = struct.unpack_from("<I", header, 24 + 56)[0]
+    except (OSError, struct.error):
+        pass
+    return identity
+
+
+def _parse_windbg_module_identity(lmv_output: str, address: int) -> dict | None:
+    info = _extract_module_info(lmv_output, address)
+    if not info:
+        return None
+
+    identity = {
+        "module": info["name"],
+        "path": None,
+        "runtime_base": info["base"],
+        "runtime_end": info["end"],
+        "address": address,
+        "rva": _runtime_to_rva(address, info["base"]),
+        "sha256": None,
+        "md5": None,
+        "pe_timestamp": None,
+        "image_size": info["end"] - info["base"],
+    }
+
+    for raw_line in lmv_output.splitlines():
+        line = raw_line.strip()
+        lower = line.lower()
+        if lower.startswith("image path:"):
+            identity["path"] = line.split(":", 1)[1].strip()
+        elif lower.startswith("image name:") and not identity.get("module"):
+            identity["module"] = line.split(":", 1)[1].strip()
+        elif lower.startswith("timestamp:"):
+            match = re.search(r"\\(([0-9a-fA-F]{8})\\)", line)
+            if match:
+                identity["pe_timestamp"] = int(match.group(1), 16)
+        elif lower.startswith("imagesize:"):
+            token = line.split(":", 1)[1].strip().split()[0]
+            try:
+                identity["image_size"] = int(token, 16)
+            except ValueError:
+                pass
+
+    disk = _pe_file_identity(identity.get("path") or "")
+    for key in ("sha256", "md5", "pe_timestamp", "image_size"):
+        if disk.get(key) is not None:
+            identity[key] = disk[key]
+    return identity
+
+
+def _runtime_identity_from_x64_module(module: dict, address: int) -> dict:
+    base = module["_base_int"]
+    module_size = _coerce_int(module.get("size")) or 0
+    disk = _pe_file_identity(module.get("path") or "")
+    return {
+        "module": module.get("name"),
+        "path": module.get("path"),
+        "runtime_base": base,
+        "runtime_end": base + module_size,
+        "address": address,
+        "rva": _runtime_to_rva(address, base),
+        "sha256": module.get("sha256") or disk.get("sha256"),
+        "md5": module.get("md5") or disk.get("md5"),
+        "pe_timestamp": _coerce_int(module.get("pe_timestamp")) or disk.get("pe_timestamp"),
+        "image_size": _coerce_int(module.get("image_size")) or disk.get("image_size") or module_size,
+    }
+
+
+def _ida_binary_identity(ida_client) -> dict:
+    info = ida_client.get_info()
+    path = info.get("input_file") or ""
+    disk = _pe_file_identity(path)
+    image_base = _coerce_int(info.get("image_base"))
+    return {
+        "module": os.path.basename(path) if path else info.get("input_file"),
+        "path": path or None,
+        "image_base": image_base,
+        "sha256": info.get("input_sha256") or disk.get("sha256"),
+        "md5": info.get("input_md5") or disk.get("md5"),
+        "pe_timestamp": _coerce_int(info.get("pe_timestamp")) or disk.get("pe_timestamp"),
+        "image_size": _coerce_int(info.get("image_size")) or disk.get("image_size"),
+    }
+
+
+def _verify_binary_identity(runtime: dict | None, ida: dict | None) -> dict:
+    if not runtime or not ida:
+        return {"verified": False, "reason": "identity_unavailable", "checks": [], "mismatches": []}
+
+    checks = []
+    mismatches = []
+
+    runtime_name = os.path.splitext(os.path.basename(runtime.get("module") or runtime.get("path") or ""))[0].lower()
+    ida_name = os.path.splitext(os.path.basename(ida.get("module") or ida.get("path") or ""))[0].lower()
+    if runtime_name and ida_name:
+        checks.append("module_name")
+        if runtime_name != ida_name:
+            mismatches.append("module_name")
+
+    build_checks = 0
+    if runtime.get("sha256") and ida.get("sha256"):
+        checks.append("sha256")
+        build_checks += 1
+        if runtime["sha256"].lower() != ida["sha256"].lower():
+            mismatches.append("sha256")
+    elif runtime.get("md5") and ida.get("md5"):
+        checks.append("md5")
+        build_checks += 1
+        if runtime["md5"].lower() != ida["md5"].lower():
+            mismatches.append("md5")
+
+    if (
+        runtime.get("pe_timestamp") is not None
+        and runtime.get("image_size") is not None
+        and ida.get("pe_timestamp") is not None
+        and ida.get("image_size") is not None
+    ):
+        checks.extend(["pe_timestamp", "image_size"])
+        build_checks += 1
+        if int(runtime["pe_timestamp"]) != int(ida["pe_timestamp"]):
+            mismatches.append("pe_timestamp")
+        if int(runtime["image_size"]) != int(ida["image_size"]):
+            mismatches.append("image_size")
+
+    if mismatches:
+        return {"verified": False, "reason": "identity_mismatch", "checks": checks, "mismatches": mismatches}
+    if build_checks == 0:
+        return {"verified": False, "reason": "insufficient_build_identity", "checks": checks, "mismatches": []}
+    return {"verified": True, "reason": "matched", "checks": checks, "mismatches": []}
+
+
 class MCOOrchestrator:
     def __init__(self):
         self.cdb = CdbSession()
@@ -219,15 +410,8 @@ class MCOOrchestrator:
     # ── Cross-Debugger Workflow 1: Crash → Static Analysis ──
 
     def crash_to_source(self, dump_path: str) -> dict:
-        """
-        Full crash analysis pipeline:
-        1. WinDbg: open dump, run !analyze -v, get crashing RIP
-        2. IDA: decompile the crashing function, list xrefs
-        Returns combined report.
-        """
+        """Analyze a crash only after runtime and IDA binary identity match."""
         result = {"dump": dump_path, "stages": []}
-
-        # Stage 1: WinDbg crash analysis
         if not os.path.exists(dump_path):
             return {"error": f"Dump not found: {dump_path}"}
 
@@ -237,104 +421,97 @@ class MCOOrchestrator:
         analyze = self.cdb.run("!analyze -v", timeout=60)
         result["stages"].append({"stage": "windbg_analyze", "output": analyze[-3000:]})
 
-        # Extract runtime fault address, then normalize through RVA before IDA.
         crash_addr = _extract_crash_address(analyze)
         result["crash_address"] = hex(crash_addr) if crash_addr else None
 
-        runtime_base = None
-        runtime_module = None
-        rva = None
+        runtime_identity = None
         if crash_addr:
-            lm_out = self.cdb.run(f"lm a {crash_addr:#x}", timeout=10)
-            result["stages"].append({"stage": "windbg_module_lookup", "output": lm_out[-1500:]})
-            module_info = _extract_module_info(lm_out, crash_addr)
-            if module_info:
-                runtime_base = module_info["base"]
-                runtime_module = module_info["name"]
-                rva = _runtime_to_rva(crash_addr, runtime_base)
+            lmv_out = self.cdb.run(f"lmv a {crash_addr:#x}", timeout=10)
+            result["stages"].append({"stage": "windbg_module_lookup", "output": lmv_out[-2000:]})
+            runtime_identity = _parse_windbg_module_identity(lmv_out, crash_addr)
 
         result["address_normalization"] = {
             "runtime_address": hex(crash_addr) if crash_addr is not None else None,
-            "runtime_module_base": hex(runtime_base) if runtime_base is not None else None,
-            "runtime_module": runtime_module,
-            "rva": hex(rva) if rva is not None else None,
+            "runtime_module_base": hex(runtime_identity["runtime_base"]) if runtime_identity else None,
+            "runtime_module": runtime_identity.get("module") if runtime_identity else None,
+            "rva": hex(runtime_identity["rva"]) if runtime_identity else None,
         }
 
-        # Stage 2: IDA decompile using IDA imagebase + runtime RVA.
-        if rva is not None and self.ida.ping():
-            ida_code = f"""
-import os
-import idc, idaapi, idautils
+        if not crash_addr:
+            result["stages"].append({"stage": "ida_decompile", "status": "fault_address_unresolved"})
+            self.cdb.close()
+            return result
+        if not runtime_identity:
+            result["stages"].append({"stage": "ida_decompile", "status": "runtime_module_identity_unresolved"})
+            self.cdb.close()
+            return result
+        if not self.ida.ping():
+            result["stages"].append({"stage": "ida_decompile", "status": "ida_not_available"})
+            self.cdb.close()
+            return result
 
+        try:
+            ida_identity = _ida_binary_identity(self.ida)
+        except Exception as exc:
+            result["binary_identity"] = {"runtime": runtime_identity, "ida": None, "verification": {"verified": False, "reason": str(exc)}}
+            result["stages"].append({"stage": "ida_decompile", "status": "ida_identity_unavailable"})
+            self.cdb.close()
+            return result
+
+        verification = _verify_binary_identity(runtime_identity, ida_identity)
+        result["binary_identity"] = {
+            "runtime": runtime_identity,
+            "ida": ida_identity,
+            "verification": verification,
+        }
+        if not verification["verified"]:
+            error = "binary_identity_mismatch" if verification["reason"] == "identity_mismatch" else "binary_identity_unverified"
+            result["ida_analysis"] = {"error": error, "verification": verification}
+            result["stages"].append({"stage": "ida_decompile", "status": error})
+            self.cdb.close()
+            return result
+
+        rva = runtime_identity["rva"]
+        runtime_base = runtime_identity["runtime_base"]
+        runtime_module = runtime_identity.get("module")
+        ida_code = f"""
+import idc, idaapi, idautils
 runtime_address = {crash_addr}
 runtime_module_base = {runtime_base}
 runtime_module = {json.dumps(runtime_module)}
 rva = {rva}
 ida_imagebase = idaapi.get_imagebase()
-ida_root = idc.get_root_filename() or ''
-runtime_stem = os.path.splitext(os.path.basename(runtime_module or ''))[0].lower()
-ida_stem = os.path.splitext(os.path.basename(ida_root))[0].lower()
-
-if runtime_stem and ida_stem and runtime_stem != ida_stem:
-    print(json.dumps({{
-        'error': 'ida_module_mismatch',
-        'runtime_module': runtime_module,
-        'ida_root_filename': ida_root,
-        'runtime_address': hex(runtime_address),
-        'rva': hex(rva),
-    }}))
-else:
-    addr = ida_imagebase + rva
-    func = idaapi.get_func(addr)
-    func_addr = func.start_ea if func else addr
-
-    # Decompile
-    try:
-        cfunc = idaapi.decompile(func_addr)
-        decompiled = str(cfunc) if cfunc else 'Decompilation failed'
-    except Exception as e:
-        decompiled = f'Error: {{e}}'
-
-    # Function info
-    func_name = idc.get_func_name(func_addr) or 'unknown'
-    func_size = (func.end_ea - func.start_ea) if func else 0
-
-    # Callers
-    callers = [hex(r.frm) for r in idautils.XrefsTo(func_addr, 0)][:10]
-
-    print(json.dumps({{
-        'function': func_name,
-        'runtime_address': hex(runtime_address),
-        'runtime_module_base': hex(runtime_module_base),
-        'runtime_module': runtime_module,
-        'ida_root_filename': ida_root,
-        'rva': hex(rva),
-        'ida_imagebase': hex(ida_imagebase),
-        'ida_address': hex(addr),
-        'function_address': hex(func_addr),
-        'size': func_size,
-        'callers': callers,
-        'decompiled': decompiled[:3000]
-    }}))
+addr = ida_imagebase + rva
+func = idaapi.get_func(addr)
+func_addr = func.start_ea if func else addr
+try:
+    cfunc = idaapi.decompile(func_addr)
+    decompiled = str(cfunc) if cfunc else 'Decompilation failed'
+except Exception as e:
+    decompiled = f'Error: {{e}}'
+func_name = idc.get_func_name(func_addr) or 'unknown'
+func_size = (func.end_ea - func.start_ea) if func else 0
+callers = [hex(r.frm) for r in idautils.XrefsTo(func_addr, 0)][:10]
+print(json.dumps({{
+    'function': func_name,
+    'runtime_address': hex(runtime_address),
+    'runtime_module_base': hex(runtime_module_base),
+    'runtime_module': runtime_module,
+    'rva': hex(rva),
+    'ida_imagebase': hex(ida_imagebase),
+    'ida_address': hex(addr),
+    'function_address': hex(func_addr),
+    'size': func_size,
+    'callers': callers,
+    'decompiled': decompiled[:3000],
+}}))
 """.strip()
-            ida_result = self.ida.exec_python(
-                "import json\n" + ida_code
-            )
-            try:
-                result["ida_analysis"] = json.loads(ida_result.strip().split("\n")[-1])
-            except Exception:
-                result["ida_analysis"] = {"raw": ida_result[:2000]}
-            ida_status = result["ida_analysis"].get("error", "ok")
-            result["stages"].append({"stage": "ida_decompile", "status": ida_status})
-        else:
-            if not crash_addr:
-                status = "fault_address_unresolved"
-            elif rva is None:
-                status = "runtime_module_base_unresolved"
-            else:
-                status = "ida_not_available"
-            result["stages"].append({"stage": "ida_decompile", "status": status})
-
+        ida_result = self.ida.exec_python("import json\n" + ida_code)
+        try:
+            result["ida_analysis"] = json.loads(ida_result.strip().split("\n")[-1])
+        except Exception:
+            result["ida_analysis"] = {"raw": ida_result[:2000]}
+        result["stages"].append({"stage": "ida_decompile", "status": result["ida_analysis"].get("error", "ok")})
         self.cdb.close()
         return result
 
@@ -401,15 +578,13 @@ print(json.dumps({'bossix_hits': hits, 'total': len(hits)}))
         address: str,
         context: str = "",
         runtime_module_base: str = "",
+        runtime_module: str = "",
+        runtime_image_sha256: str = "",
+        runtime_image_md5: str = "",
+        runtime_pe_timestamp: str = "",
+        runtime_image_size: str = "",
     ) -> dict:
-        """
-        Normalize a runtime address through RVA before analyzing it in IDA.
-
-        If runtime_module_base is omitted, the orchestrator tries to resolve the
-        containing module from the live x64dbg modules list. If normalization is
-        unavailable, the address is only accepted when it is already mapped in
-        the current IDA database.
-        """
+        """Normalize runtime -> RVA -> IDA only after binary identity verification."""
         try:
             addr_int = int(address, 16)
         except (TypeError, ValueError):
@@ -419,8 +594,8 @@ print(json.dumps({'bossix_hits': hits, 'total': len(hits)}))
             return {"error": "IDA Pro not available"}
 
         runtime_base = None
-        module_name = None
         normalization_source = None
+        runtime_identity = None
 
         if runtime_module_base:
             try:
@@ -428,85 +603,116 @@ print(json.dumps({'bossix_hits': hits, 'total': len(hits)}))
                 normalization_source = "explicit_runtime_module_base"
             except (TypeError, ValueError):
                 return {"error": f"Invalid runtime_module_base: {runtime_module_base}"}
-        else:
+
+            runtime_identity = {
+                "module": runtime_module or None,
+                "path": None,
+                "runtime_base": runtime_base,
+                "runtime_end": None,
+                "address": addr_int,
+                "rva": _runtime_to_rva(addr_int, runtime_base),
+                "sha256": runtime_image_sha256 or None,
+                "md5": runtime_image_md5 or None,
+                "pe_timestamp": _coerce_int(runtime_pe_timestamp),
+                "image_size": _coerce_int(runtime_image_size),
+            }
+
+        explicit_has_build_identity = bool(
+            runtime_identity
+            and (
+                runtime_identity.get("sha256")
+                or runtime_identity.get("md5")
+                or (
+                    runtime_identity.get("pe_timestamp") is not None
+                    and runtime_identity.get("image_size") is not None
+                )
+            )
+        )
+
+        if runtime_base is None or not explicit_has_build_identity:
             x64_snapshot = self._x64_modules_snapshot()
             if "error" not in x64_snapshot:
                 module = _find_runtime_module(x64_snapshot.get("modules", []), addr_int)
                 if module:
-                    runtime_base = module["_base_int"]
-                    module_name = module.get("name")
+                    x64_identity = _runtime_identity_from_x64_module(module, addr_int)
+                    if runtime_base is not None and x64_identity["runtime_base"] != runtime_base:
+                        return {
+                            "error": "runtime_module_base_mismatch",
+                            "explicit_base": hex(runtime_base),
+                            "x64dbg_base": hex(x64_identity["runtime_base"]),
+                        }
+                    runtime_base = x64_identity["runtime_base"]
+                    runtime_identity = x64_identity
                     normalization_source = "x64dbg_modules"
 
-        rva = _runtime_to_rva(addr_int, runtime_base) if runtime_base is not None else None
+        rva = runtime_identity["rva"] if runtime_identity else None
+        ida_identity = None
+        verification = None
+        if rva is not None:
+            ida_identity = _ida_binary_identity(self.ida)
+            verification = _verify_binary_identity(runtime_identity, ida_identity)
+            if not verification["verified"]:
+                return {
+                    "error": "binary_identity_mismatch" if verification["reason"] == "identity_mismatch" else "binary_identity_unverified",
+                    "address_normalization": {
+                        "runtime_address": hex(addr_int),
+                        "runtime_module_base": hex(runtime_base) if runtime_base is not None else None,
+                        "rva": hex(rva),
+                        "runtime_module": runtime_identity.get("module") if runtime_identity else None,
+                        "source": normalization_source,
+                    },
+                    "binary_identity": {
+                        "runtime": runtime_identity,
+                        "ida": ida_identity,
+                        "verification": verification,
+                    },
+                }
+
         rva_literal = "None" if rva is None else str(rva)
-        module_literal = repr(module_name)
-
         code = f"""
-import os
 import idc, idaapi, idautils, ida_segment, json
-
 input_addr = {addr_int}
 rva = {rva_literal}
-runtime_module = {module_literal}
 ida_imagebase = idaapi.get_imagebase()
-ida_root = idc.get_root_filename() or ''
-runtime_stem = os.path.splitext(os.path.basename(runtime_module or ''))[0].lower()
-ida_stem = os.path.splitext(os.path.basename(ida_root))[0].lower()
-
-if rva is not None and runtime_stem and ida_stem and runtime_stem != ida_stem:
+addr = ida_imagebase + rva if rva is not None else input_addr
+segment = ida_segment.getseg(addr)
+if segment is None:
     print(json.dumps({{
-        'error': 'ida_module_mismatch',
-        'runtime_module': runtime_module,
-        'ida_root_filename': ida_root,
+        'error': 'address_not_mapped_in_ida',
         'input_address': hex(input_addr),
-        'rva': hex(rva),
+        'rva': hex(rva) if rva is not None else None,
+        'ida_imagebase': hex(ida_imagebase),
+        'candidate_ida_address': hex(addr),
     }}))
 else:
-    addr = ida_imagebase + rva if rva is not None else input_addr
-    segment = ida_segment.getseg(addr)
-
-    if segment is None:
-        print(json.dumps({{
-            'error': 'address_not_mapped_in_ida',
-            'input_address': hex(input_addr),
-            'rva': hex(rva) if rva is not None else None,
-            'ida_imagebase': hex(ida_imagebase),
-            'candidate_ida_address': hex(addr),
-        }}))
-    else:
-        func = idaapi.get_func(addr)
-        func_start = func.start_ea if func else addr
-
-        result = {{
-            'input_address': hex(input_addr),
-            'rva': hex(rva) if rva is not None else None,
-            'ida_imagebase': hex(ida_imagebase),
-            'ida_root_filename': ida_root,
-            'ida_address': hex(addr),
-            'function_start': hex(func_start),
-            'function_name': idc.get_func_name(func_start) or 'sub_{{:X}}'.format(func_start),
-            'module': idc.get_segm_name(func_start),
-            'flags': idc.get_full_flags(addr),
-        }}
-
-        try:
-            cfunc = idaapi.decompile(func_start)
-            result['pseudocode'] = str(cfunc)[:4000] if cfunc else None
-        except Exception as e:
-            result['pseudocode'] = None
-            result['decompile_error'] = str(e)
-
-        result['xrefs_to'] = [hex(r.frm) for r in idautils.XrefsTo(addr, 0)][:15]
-        result['calls_out'] = []
-        if func:
-            for head in idautils.Heads(func_start, func.end_ea):
-                if idc.is_call_insn(head):
-                    target = idc.get_operand_value(head, 0)
-                    name = idc.get_func_name(target)
-                    if name:
-                        result['calls_out'].append({{'from': hex(head), 'to': name}})
-
-        print(json.dumps(result))
+    func = idaapi.get_func(addr)
+    func_start = func.start_ea if func else addr
+    result = {{
+        'input_address': hex(input_addr),
+        'rva': hex(rva) if rva is not None else None,
+        'ida_imagebase': hex(ida_imagebase),
+        'ida_address': hex(addr),
+        'function_start': hex(func_start),
+        'function_name': idc.get_func_name(func_start) or 'sub_{{:X}}'.format(func_start),
+        'module': idc.get_segm_name(func_start),
+        'flags': idc.get_full_flags(addr),
+    }}
+    try:
+        cfunc = idaapi.decompile(func_start)
+        result['pseudocode'] = str(cfunc)[:4000] if cfunc else None
+    except Exception as e:
+        result['pseudocode'] = None
+        result['decompile_error'] = str(e)
+    result['xrefs_to'] = [hex(r.frm) for r in idautils.XrefsTo(addr, 0)][:15]
+    result['calls_out'] = []
+    if func:
+        for head in idautils.Heads(func_start, func.end_ea):
+            if idc.is_call_insn(head):
+                target = idc.get_operand_value(head, 0)
+                name = idc.get_func_name(target)
+                if name:
+                    result['calls_out'].append({{'from': hex(head), 'to': name}})
+    print(json.dumps(result))
 """
         raw = self.ida.exec_python(code)
         try:
@@ -518,12 +724,16 @@ else:
             "runtime_address": hex(addr_int),
             "runtime_module_base": hex(runtime_base) if runtime_base is not None else None,
             "rva": hex(rva) if rva is not None else None,
-            "runtime_module": module_name,
+            "runtime_module": runtime_identity.get("module") if runtime_identity else None,
             "source": normalization_source or "already_mapped_ida_address",
+        }
+        parsed["binary_identity"] = {
+            "runtime": runtime_identity,
+            "ida": ida_identity,
+            "verification": verification or {"verified": True, "reason": "already_mapped_ida_address", "checks": []},
         }
         if context:
             parsed["context_from_windbg"] = context[:500]
-
         return parsed
 
     # ── Cross-Debugger Workflow 4: Full w Audit ───────
@@ -790,6 +1000,26 @@ class MCPServer:
                         "runtime_module_base": {
                             "type": "string",
                             "description": "Optional runtime module base for ASLR-safe RVA normalization, e.g. '0x7FF712000000'"
+                        },
+                        "runtime_module": {
+                            "type": "string",
+                            "description": "Runtime module filename when x64dbg metadata is unavailable"
+                        },
+                        "runtime_image_sha256": {
+                            "type": "string",
+                            "description": "Expected SHA-256 of the runtime module for build verification"
+                        },
+                        "runtime_image_md5": {
+                            "type": "string",
+                            "description": "Expected MD5 of the runtime module when SHA-256 is unavailable"
+                        },
+                        "runtime_pe_timestamp": {
+                            "type": "string",
+                            "description": "PE TimeDateStamp (decimal or 0x-prefixed hex)"
+                        },
+                        "runtime_image_size": {
+                            "type": "string",
+                            "description": "PE SizeOfImage (decimal or 0x-prefixed hex)"
                         }
                     },
                     "required": ["address"]
@@ -888,6 +1118,11 @@ class MCPServer:
                         args["address"],
                         args.get("context", ""),
                         args.get("runtime_module_base", ""),
+                        args.get("runtime_module", ""),
+                        args.get("runtime_image_sha256", ""),
+                        args.get("runtime_image_md5", ""),
+                        args.get("runtime_pe_timestamp", ""),
+                        args.get("runtime_image_size", ""),
                     ))
                 elif tool == "mco_w_audit":
                     result = self._ok(self.orchestrator.quick_w_audit())

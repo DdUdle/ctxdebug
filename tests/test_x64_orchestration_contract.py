@@ -281,10 +281,13 @@ def test_crash_to_source_passes_rva_to_ida(tmp_path):
                     "ExceptionAddress: "
                     "00007ff6`12123456 (sample!crash_here+0x16)"
                 )
-            if command.startswith("lm a "):
+            if command.startswith("lmv a "):
                 return (
                     "start             end                 module name\n"
-                    "00007ff6`12000000 00007ff6`12200000 sample"
+                    "00007ff6`12000000 00007ff6`12200000 sample\n"
+                    "    Image name: sample.exe\n"
+                    "    Timestamp: Wed Aug 12 12:00:00 2020 (5F3759DF)\n"
+                    "    ImageSize: 00200000\n"
                 )
             raise AssertionError(command)
 
@@ -294,6 +297,14 @@ def test_crash_to_source_passes_rva_to_ida(tmp_path):
     class FakeIda:
         def ping(self):
             return True
+
+        def get_info(self):
+            return {
+                "input_file": "sample.exe",
+                "image_base": "0x140000000",
+                "pe_timestamp": "0x5F3759DF",
+                "image_size": "0x200000",
+            }
 
         def exec_python(self, code):
             assert f"runtime_address = {runtime}" in code
@@ -326,6 +337,9 @@ def test_crash_to_source_passes_rva_to_ida(tmp_path):
         "rva": hex(expected_rva),
     }
     assert result["ida_analysis"]["ida_address"] == hex(0x140000000 + expected_rva)
+    assert result["binary_identity"]["verification"]["verified"] is True
+    assert "pe_timestamp" in result["binary_identity"]["verification"]["checks"]
+    assert "image_size" in result["binary_identity"]["verification"]["checks"]
 
 
 def test_x64_module_lookup_supports_hex_bases():
@@ -350,12 +364,17 @@ def test_pivot_to_ida_uses_explicit_runtime_base_for_aslr():
         def ping(self):
             return True
 
+        def get_info(self):
+            return {
+                "input_file": "sample.exe",
+                "image_base": "0x140000000",
+                "pe_timestamp": "0x5F3759DF",
+                "image_size": "0x200000",
+            }
+
         def exec_python(self, code):
             assert f"input_addr = {runtime}" in code
             assert f"rva = {expected_rva}" in code
-            assert "runtime_module = None" in code
-            assert "runtime_module = null" not in code
-            assert "ida_module_mismatch" in code
             assert "addr = ida_imagebase + rva if rva is not None else input_addr" in code
             return json.dumps(
                 {
@@ -373,6 +392,9 @@ def test_pivot_to_ida_uses_explicit_runtime_base_for_aslr():
         result = orchestrator.pivot_to_ida(
             hex(runtime),
             runtime_module_base=hex(base),
+            runtime_module="sample.exe",
+            runtime_pe_timestamp="0x5F3759DF",
+            runtime_image_size="0x200000",
         )
     finally:
         orchestrator.close()
@@ -381,10 +403,11 @@ def test_pivot_to_ida_uses_explicit_runtime_base_for_aslr():
         "runtime_address": hex(runtime),
         "runtime_module_base": hex(base),
         "rva": hex(expected_rva),
-        "runtime_module": None,
+        "runtime_module": "sample.exe",
         "source": "explicit_runtime_module_base",
     }
     assert result["ida_address"] == hex(0x140000000 + expected_rva)
+    assert result["binary_identity"]["verification"]["verified"] is True
 
 
 def test_pivot_to_ida_resolves_x64dbg_module_before_applying_rva():
@@ -397,12 +420,17 @@ def test_pivot_to_ida_resolves_x64dbg_module_before_applying_rva():
         def ping(self):
             return True
 
+        def get_info(self):
+            return {
+                "input_file": "sample.exe",
+                "image_base": "0x140000000",
+                "pe_timestamp": "0x5F3759DF",
+                "image_size": "0x200000",
+            }
+
         def exec_python(self, code):
             assert f"input_addr = {runtime}" in code
             assert f"rva = {expected_rva}" in code
-            assert "runtime_module = 'sample.exe'" in code
-            assert "ida_module_mismatch" in code
-            assert "idc.get_root_filename()" in code
             assert "ida_segment.getseg(addr)" in code
             return json.dumps(
                 {
@@ -435,6 +463,8 @@ def test_pivot_to_ida_resolves_x64dbg_module_before_applying_rva():
                     "base": hex(base),
                     "size": 0x200000,
                     "name": "sample.exe",
+                    "pe_timestamp": "0x5F3759DF",
+                    "image_size": "0x200000",
                 }
             ]
 
@@ -453,7 +483,71 @@ def test_pivot_to_ida_resolves_x64dbg_module_before_applying_rva():
         "runtime_module": "sample.exe",
         "source": "x64dbg_modules",
     }
+    assert result["binary_identity"]["verification"]["verified"] is True
     assert calls == ["get_modules", "disconnect"]
+
+
+def test_binary_identity_hash_mismatch_blocks_pivot():
+    runtime = 0x7FF612123456
+    base = 0x7FF612000000
+
+    class FakeIda:
+        def ping(self):
+            return True
+
+        def get_info(self):
+            return {
+                "input_file": "sample.exe",
+                "image_base": "0x140000000",
+                "input_sha256": "b" * 64,
+            }
+
+        def exec_python(self, code):
+            raise AssertionError("decompile must not run for mismatched build identity")
+
+    orchestrator = mco_orchestrator.MCOOrchestrator()
+    orchestrator.ida = FakeIda()
+    try:
+        result = orchestrator.pivot_to_ida(
+            hex(runtime),
+            runtime_module_base=hex(base),
+            runtime_module="sample.exe",
+            runtime_image_sha256="a" * 64,
+        )
+    finally:
+        orchestrator.close()
+
+    assert result["error"] == "binary_identity_mismatch"
+    assert result["binary_identity"]["verification"]["mismatches"] == ["sha256"]
+
+
+def test_binary_identity_unverified_blocks_pivot():
+    runtime = 0x7FF612123456
+    base = 0x7FF612000000
+
+    class FakeIda:
+        def ping(self):
+            return True
+
+        def get_info(self):
+            return {"input_file": "sample.exe", "image_base": "0x140000000"}
+
+        def exec_python(self, code):
+            raise AssertionError("decompile must not run without build identity")
+
+    orchestrator = mco_orchestrator.MCOOrchestrator()
+    orchestrator.ida = FakeIda()
+    try:
+        result = orchestrator.pivot_to_ida(
+            hex(runtime),
+            runtime_module_base=hex(base),
+            runtime_module="sample.exe",
+        )
+    finally:
+        orchestrator.close()
+
+    assert result["error"] == "binary_identity_unverified"
+    assert result["binary_identity"]["verification"]["reason"] == "insufficient_build_identity"
 
 
 def test_mcp_boundary_exposes_p0_x64dbg_workflows():
