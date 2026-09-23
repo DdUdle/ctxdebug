@@ -281,10 +281,13 @@ def test_crash_to_source_passes_rva_to_ida(tmp_path):
                     "ExceptionAddress: "
                     "00007ff6`12123456 (sample!crash_here+0x16)"
                 )
-            if command.startswith("lm a "):
+            if command.startswith("lmv a "):
                 return (
                     "start             end                 module name\n"
-                    "00007ff6`12000000 00007ff6`12200000 sample"
+                    "00007ff6`12000000 00007ff6`12200000 sample\n"
+                    "    Image name: sample.exe\n"
+                    "    Timestamp: Wed Aug 12 12:00:00 2020 (5F3759DF)\n"
+                    "    ImageSize: 00200000\n"
                 )
             raise AssertionError(command)
 
