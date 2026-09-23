@@ -234,18 +234,19 @@ def _parse_windbg_module_identity(lmv_output: str, address: int) -> dict | None:
 
 def _runtime_identity_from_x64_module(module: dict, address: int) -> dict:
     base = module["_base_int"]
+    module_size = _coerce_int(module.get("size")) or 0
     disk = _pe_file_identity(module.get("path") or "")
     return {
         "module": module.get("name"),
         "path": module.get("path"),
         "runtime_base": base,
-        "runtime_end": base + int(module.get("size") or 0),
+        "runtime_end": base + module_size,
         "address": address,
         "rva": _runtime_to_rva(address, base),
         "sha256": module.get("sha256") or disk.get("sha256"),
         "md5": module.get("md5") or disk.get("md5"),
         "pe_timestamp": _coerce_int(module.get("pe_timestamp")) or disk.get("pe_timestamp"),
-        "image_size": _coerce_int(module.get("image_size")) or disk.get("image_size") or _coerce_int(module.get("size")),
+        "image_size": _coerce_int(module.get("image_size")) or disk.get("image_size") or module_size,
     }
 
 
@@ -603,22 +604,6 @@ print(json.dumps({'bossix_hits': hits, 'total': len(hits)}))
             except (TypeError, ValueError):
                 return {"error": f"Invalid runtime_module_base: {runtime_module_base}"}
 
-        x64_snapshot = self._x64_modules_snapshot()
-        if "error" not in x64_snapshot:
-            module = _find_runtime_module(x64_snapshot.get("modules", []), addr_int)
-            if module:
-                x64_identity = _runtime_identity_from_x64_module(module, addr_int)
-                if runtime_base is not None and x64_identity["runtime_base"] != runtime_base:
-                    return {
-                        "error": "runtime_module_base_mismatch",
-                        "explicit_base": hex(runtime_base),
-                        "x64dbg_base": hex(x64_identity["runtime_base"]),
-                    }
-                runtime_base = x64_identity["runtime_base"]
-                runtime_identity = x64_identity
-                normalization_source = "x64dbg_modules"
-
-        if runtime_base is not None and runtime_identity is None:
             runtime_identity = {
                 "module": runtime_module or None,
                 "path": None,
@@ -632,10 +617,39 @@ print(json.dumps({'bossix_hits': hits, 'total': len(hits)}))
                 "image_size": _coerce_int(runtime_image_size),
             }
 
+        explicit_has_build_identity = bool(
+            runtime_identity
+            and (
+                runtime_identity.get("sha256")
+                or runtime_identity.get("md5")
+                or (
+                    runtime_identity.get("pe_timestamp") is not None
+                    and runtime_identity.get("image_size") is not None
+                )
+            )
+        )
+
+        if runtime_base is None or not explicit_has_build_identity:
+            x64_snapshot = self._x64_modules_snapshot()
+            if "error" not in x64_snapshot:
+                module = _find_runtime_module(x64_snapshot.get("modules", []), addr_int)
+                if module:
+                    x64_identity = _runtime_identity_from_x64_module(module, addr_int)
+                    if runtime_base is not None and x64_identity["runtime_base"] != runtime_base:
+                        return {
+                            "error": "runtime_module_base_mismatch",
+                            "explicit_base": hex(runtime_base),
+                            "x64dbg_base": hex(x64_identity["runtime_base"]),
+                        }
+                    runtime_base = x64_identity["runtime_base"]
+                    runtime_identity = x64_identity
+                    normalization_source = "x64dbg_modules"
+
         rva = runtime_identity["rva"] if runtime_identity else None
-        ida_identity = _ida_binary_identity(self.ida)
+        ida_identity = None
         verification = None
         if rva is not None:
+            ida_identity = _ida_binary_identity(self.ida)
             verification = _verify_binary_identity(runtime_identity, ida_identity)
             if not verification["verified"]:
                 return {
