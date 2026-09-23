@@ -258,6 +258,14 @@ class MCOOrchestrator:
 
         return self._run_async(collect())
 
+    def _x64_modules_snapshot(self) -> dict:
+        async def collect():
+            if not await self._ensure_x64():
+                return {"error": "x64dbg plugin not running"}
+            return {"modules": await self.x64.get_modules()}
+
+        return self._run_async(collect())
+
     def _x64_runtime_snapshot(self) -> dict:
         async def collect():
             if not await self._ensure_x64():
@@ -487,7 +495,7 @@ print(json.dumps({'bossix_hits': hits, 'total': len(hits)}))
             except (TypeError, ValueError):
                 return {"error": f"Invalid runtime_module_base: {runtime_module_base}"}
         else:
-            x64_snapshot = self._x64_runtime_snapshot()
+            x64_snapshot = self._x64_modules_snapshot()
             if "error" not in x64_snapshot:
                 module = _find_runtime_module(x64_snapshot.get("modules", []), addr_int)
                 if module:
