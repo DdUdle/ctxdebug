@@ -8,9 +8,9 @@ Usage:
     claude mcp add mco -- python "C:\path\mco_orchestrator.py"
 
 Environment:
-    CDB_PATH        — path to cdb.exe (WinDbg headless)
-    IDA_HOST        — IDA HTTP server host (default: localhost)
-    IDA_PORT        — IDA HTTP server port (default: 2022)
+    WINDBG_MCP_CDB  — path to cdb.exe (shared with windbg_mcp)
+    IDA_MCP_HOST    — IDA HTTP server host (shared with ida_mcp)
+    IDA_MCP_PORT    — IDA HTTP server port (shared with ida_mcp)
     X64DBG_PIPE     — x64dbg named pipe (default: \\.\pipe\x64dbg_ai_agent)
 """
 
@@ -27,132 +27,19 @@ from contextlib import contextmanager
 from typing import Any
 
 from agent.bridge import X64DbgBridge
+from ida_mcp import IDAClient
+from windbg_backend import CdbSession
 from mco_common import serve_stdio, text_error, text_result
 
 logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
 log = logging.getLogger("mco")
 
 # ─────────────────────────────────────────────────────────────
-#  Backend Clients (lightweight, no deps on other MCP servers)
+#  Shared debugger backends
 # ─────────────────────────────────────────────────────────────
-
-class CdbClient:
-    """Minimal cdb.exe wrapper for orchestrator use."""
-
-    DEFAULT_CDB = os.environ.get(
-        "CDB_PATH",
-        r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe"
-    )
-
-    def __init__(self):
-        self._proc: subprocess.Popen | None = None
-
-    @property
-    def connected(self) -> bool:
-        return self._proc is not None and self._proc.poll() is None
-
-    def open_dump(self, dump_path: str) -> str:
-        if not os.path.exists(self.DEFAULT_CDB):
-            return f"ERROR: cdb.exe not found at {self.DEFAULT_CDB}"
-        cmd = [self.DEFAULT_CDB, "-z", dump_path, "-lines", "-nosqm"]
-        try:
-            self._proc = subprocess.Popen(
-                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT, text=True, bufsize=1
-            )
-            return self._read_until_prompt(timeout=15)
-        except Exception as e:
-            return f"ERROR: {e}"
-
-    def run(self, cmd: str, timeout: float = 30) -> str:
-        if not self.connected:
-            return "ERROR: Not connected to cdb.exe"
-        try:
-            self._proc.stdin.write(cmd + "\n")
-            self._proc.stdin.flush()
-            return self._read_until_prompt(timeout=timeout)
-        except Exception as e:
-            return f"ERROR: {e}"
-
-    def _read_until_prompt(self, timeout: float = 30) -> str:
-        lines = []
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            line = self._proc.stdout.readline()
-            if not line:
-                break
-            lines.append(line.rstrip())
-            if line.rstrip().endswith(">"):
-                break
-        return "\n".join(lines)
-
-    def close(self):
-        if self._proc:
-            try:
-                self._proc.stdin.write("q\n")
-                self._proc.stdin.flush()
-                self._proc.wait(timeout=3)
-            except Exception:
-                self._proc.terminate()
-            self._proc = None
-
-
-class IDAClient:
-    """Minimal IDA Pro REST client for orchestrator use."""
-
-    ENDPOINTS = ["/api/v1/py", "/api/python", "/python", "/exec", "/api/1/exec"]
-
-    def __init__(self):
-        host = os.environ.get("IDA_HOST", "localhost")
-        port = os.environ.get("IDA_PORT", "2022")
-        self.token = os.environ.get("IDA_MCP_TOKEN", "")
-        self.base = f"http://{host}:{port}"
-        self._endpoint: str | None = None
-
-    def _headers(self) -> dict:
-        h = {"Content-Type": "text/plain"}
-        if self.token:
-            h["Authorization"] = f"Bearer {self.token}"
-        return h
-
-    def _find_endpoint(self) -> str | None:
-        for ep in self.ENDPOINTS:
-            try:
-                req = urllib.request.Request(
-                    self.base + ep,
-                    data=b"return 'ok'",
-                    method="POST",
-                    headers=self._headers()
-                )
-                with urllib.request.urlopen(req, timeout=3) as r:
-                    if r.status == 200:
-                        return ep
-            except Exception:
-                pass
-        return None
-
-    @property
-    def available(self) -> bool:
-        if self._endpoint is None:
-            self._endpoint = self._find_endpoint()
-        return self._endpoint is not None
-
-    def exec_python(self, code: str) -> str:
-        if not self.available:
-            return "ERROR: IDA Pro not available (run ida_server_plugin.py inside IDA)"
-        try:
-            req = urllib.request.Request(
-                self.base + self._endpoint,
-                data=code.encode(),
-                method="POST",
-                headers=self._headers()
-            )
-            with urllib.request.urlopen(req, timeout=20) as r:
-                return r.read().decode()
-        except Exception as e:
-            self._endpoint = None
-            return f"ERROR: {e}"
-
+# IDA transport/API lives in ida_mcp.IDAClient.
+# WinDbg/cdb lifecycle lives in windbg_backend.CdbSession.
+# x64dbg transport/API lives in agent.bridge.X64DbgBridge.
 
 # ─────────────────────────────────────────────────────────────
 #  Orchestrator
@@ -236,7 +123,7 @@ def _find_runtime_module(modules: list[dict], address: int) -> dict | None:
 
 class MCOOrchestrator:
     def __init__(self):
-        self.cdb = CdbClient()
+        self.cdb = CdbSession()
         self.ida = IDAClient()
         pipe_name = os.environ.get("X64DBG_PIPE") or X64DbgBridge.PIPE_NAME
         self.x64 = X64DbgBridge(pipe_name=pipe_name)
@@ -306,14 +193,14 @@ class MCOOrchestrator:
 
     def debugger_status(self) -> dict:
         """Check which debuggers are available right now."""
-        windbg_ok = os.path.exists(self.cdb.DEFAULT_CDB)
-        ida_ok = self.ida.available
+        windbg_ok = self.cdb.available
+        ida_ok = self.ida.ping()
         x64_ok = self._x64_available()
         return {
             "windbg": {
                 "available": windbg_ok,
                 "connected": self.cdb.connected,
-                "path": self.cdb.DEFAULT_CDB,
+                "path": self.cdb.cdb_path,
                 "status": "ready" if windbg_ok else "cdb.exe not found"
             },
             "ida": {
@@ -374,7 +261,7 @@ class MCOOrchestrator:
         }
 
         # Stage 2: IDA decompile using IDA imagebase + runtime RVA.
-        if rva is not None and self.ida.available:
+        if rva is not None and self.ida.ping():
             ida_code = f"""
 import os
 import idc, idaapi, idautils
@@ -462,7 +349,7 @@ else:
         result = {}
 
         # IDA static scan
-        if self.ida.available:
+        if self.ida.ping():
             ida_code = """
 import idc, idautils, idaapi, json
 
@@ -528,7 +415,7 @@ print(json.dumps({'bossix_hits': hits, 'total': len(hits)}))
         except (TypeError, ValueError):
             return {"error": f"Invalid address: {address}"}
 
-        if not self.ida.available:
+        if not self.ida.ping():
             return {"error": "IDA Pro not available"}
 
         runtime_base = None
@@ -650,7 +537,7 @@ else:
         """
         report = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"), "findings": []}
 
-        if self.ida.available:
+        if self.ida.ping():
             code = """
 import idc, idautils, idaapi, ida_search, json
 
@@ -740,7 +627,7 @@ print(json.dumps(summary))
         addr_a_repr = json.dumps(str(addr_a))
         addr_b_repr = json.dumps(str(addr_b))
 
-        if not self.ida.available:
+        if not self.ida.ping():
             return {"error": "IDA not available"}
 
         code = f"""
@@ -804,7 +691,7 @@ print(json.dumps(result))
         else:
             result["windbg"] = {"status": "not connected — call windbg_open_dump first"}
 
-        if self.ida.available:
+        if self.ida.ping():
             code = """
 import idc, idautils, json
 
