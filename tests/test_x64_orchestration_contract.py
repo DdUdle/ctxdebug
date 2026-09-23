@@ -399,6 +399,7 @@ def test_pivot_to_ida_resolves_x64dbg_module_before_applying_rva():
             assert "runtime_module = 'sample.exe'" in code
             assert "ida_module_mismatch" in code
             assert "idc.get_root_filename()" in code
+            assert "ida_segment.getseg(addr)" in code
             return json.dumps(
                 {
                     "input_address": hex(runtime),
