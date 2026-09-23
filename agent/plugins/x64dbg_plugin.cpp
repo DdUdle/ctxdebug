@@ -912,6 +912,7 @@ static void handle_client(HANDLE pipe) {
         PipeHeader hdr;
         if (!read_exact(pipe, &hdr, sizeof(hdr))) break;
         if (memcmp(hdr.magic, PIPE_MAGIC, 4) != 0) break;
+        if (hdr.version != PIPE_VERSION) break;
         if (hdr.payload_len > 64u * 1024u * 1024u) break;
 
         std::string payload(hdr.payload_len, '\0');
