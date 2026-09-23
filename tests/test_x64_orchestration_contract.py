@@ -1,5 +1,8 @@
 import inspect
 import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -97,6 +100,66 @@ def test_plugin_registers_all_orchestrator_p0_handlers():
     assert "std::vector<Context> stack;" in cpp
     assert "ctx.kind == ContainerKind::ARRAY" in cpp
     assert "if (!ctx.first) s += ',';" in cpp
+
+
+def test_plugin_json_builder_emits_valid_object_arrays(tmp_path):
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if compiler is None:
+        pytest.skip("standalone JsonBuilder contract requires g++ or clang++")
+
+    cpp = (
+        Path(__file__).resolve().parents[1]
+        / "agent"
+        / "plugins"
+        / "x64dbg_plugin.cpp"
+    ).read_text(encoding="utf-8", errors="replace")
+    start = cpp.index("class JsonBuilder {")
+    end = cpp.index("\nstatic std::string hex64", start)
+    builder = cpp[start:end]
+
+    source = tmp_path / "json_builder_contract.cpp"
+    exe = tmp_path / ("json_builder_contract.exe" if os.name == "nt" else "json_builder_contract")
+    source.write_text(
+        """
+#include <cstdint>
+#include <cstdio>
+#include <string>
+#include <vector>
+"""
+        + builder
+        + r"""
+int main() {
+    JsonBuilder j;
+    j.begin_object().key("modules").begin_array();
+    j.begin_object().key("name").val("a").key("size").val((uint64_t)1).end_object();
+    j.begin_object().key("name").val("b").key("size").val((uint64_t)2).end_object();
+    j.end_array().key("ok").val(true).end_object();
+    std::printf("%s", j.str().c_str());
+}
+""",
+        encoding="utf-8",
+    )
+
+    subprocess.run(
+        [compiler, "-std=c++20", str(source), "-o", str(exe)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    completed = subprocess.run(
+        [str(exe)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(completed.stdout) == {
+        "modules": [
+            {"name": "a", "size": 1},
+            {"name": "b", "size": 2},
+        ],
+        "ok": True,
+    }
 
 
 def test_orchestrator_uses_shared_bridge_not_private_pipe_client():
