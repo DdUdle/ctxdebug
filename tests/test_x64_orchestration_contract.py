@@ -107,7 +107,7 @@ def test_orchestrator_uses_shared_bridge_not_private_pipe_client():
 def test_windbg_runtime_address_normalizes_to_rva():
     lm_output = """
 start             end                 module name
-00007ff6\`12000000 00007ff6\`12200000   sample
+00007ff6`12000000 00007ff6`12200000   sample
 """
     runtime = 0x00007FF612123456
     base = mco_orchestrator._extract_module_base(lm_output, runtime)
@@ -120,7 +120,7 @@ def test_fault_ip_parser_handles_symbol_line_before_address():
     analyze = """
 FAULT_IP:
 sample!crash_here+0x16
-00007ff6\`12123456 488b01          mov     rax,qword ptr [rcx]
+00007ff6`12123456 488b01          mov     rax,qword ptr [rcx]
 """
     assert mco_orchestrator._extract_crash_address(analyze) == 0x00007FF612123456
 
@@ -144,12 +144,12 @@ def test_crash_to_source_passes_rva_to_ida(tmp_path):
             if command == "!analyze -v":
                 return (
                     "ExceptionAddress: "
-                    "00007ff6\`12123456 (sample!crash_here+0x16)"
+                    "00007ff6`12123456 (sample!crash_here+0x16)"
                 )
             if command.startswith("lm a "):
                 return (
                     "start             end                 module name\n"
-                    "00007ff6\`12000000 00007ff6\`12200000 sample"
+                    "00007ff6`12000000 00007ff6`12200000 sample"
                 )
             raise AssertionError(command)
 
