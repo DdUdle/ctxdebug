@@ -22,6 +22,7 @@ import ipaddress
 import json
 import os
 import secrets
+import struct
 import sys
 import threading
 import traceback
@@ -57,6 +58,31 @@ def _md5_hex(raw) -> str:
     if text.lower().startswith("0x"):
         text = text[2:]
     return text
+
+
+def _read_pe_identity(path: str) -> dict:
+    """Read PE timestamp and SizeOfImage from the original input file."""
+    result = {"pe_timestamp": None, "pe_size_of_image": None, "build_id": None}
+    if not path:
+        return result
+    try:
+        with open(path, "rb") as f:
+            dos = f.read(0x40)
+            if len(dos) < 0x40 or dos[:2] != b"MZ":
+                return result
+            pe_off = struct.unpack_from("<I", dos, 0x3C)[0]
+            f.seek(pe_off)
+            header = f.read(0x60)
+        if len(header) < 0x54 or header[:4] != b"PE\0\0":
+            return result
+        timestamp = struct.unpack_from("<I", header, 8)[0]
+        size_of_image = struct.unpack_from("<I", header, 24 + 56)[0]
+        result["pe_timestamp"] = timestamp
+        result["pe_size_of_image"] = size_of_image
+        result["build_id"] = f"pe:{timestamp:08x}:{size_of_image:x}"
+    except Exception:
+        pass
+    return result
 
 
 def _is_idaq() -> bool:
@@ -242,6 +268,8 @@ def _collect_info() -> dict:
     except Exception:
         image_base = "0x0"
 
+    pe_identity = _read_pe_identity(input_file)
+
     return {
         "server": "MCO ida_server_plugin",
         "input_file": input_file,
@@ -254,6 +282,9 @@ def _collect_info() -> dict:
         "file_type": file_type,
         "is_dll": is_dll,
         "input_md5": md5,
+        "pe_timestamp": pe_identity["pe_timestamp"],
+        "pe_size_of_image": pe_identity["pe_size_of_image"],
+        "build_id": pe_identity["build_id"],
     }
 
 

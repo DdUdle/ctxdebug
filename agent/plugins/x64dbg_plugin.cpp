@@ -335,6 +335,35 @@ static std::string hex64(uint64_t v) {
     return buf;
 }
 
+static bool read_pe_build_identity(
+    uint64_t base,
+    uint32_t& timestamp,
+    uint32_t& size_of_image
+) {
+    uint32_t pe_offset = 0;
+    if (!Script::Memory::Read(base + 0x3C, &pe_offset, sizeof(pe_offset), nullptr))
+        return false;
+    if (pe_offset < 0x40 || pe_offset > 0x100000)
+        return false;
+
+    uint32_t signature = 0;
+    if (!Script::Memory::Read(base + pe_offset, &signature, sizeof(signature), nullptr))
+        return false;
+    if (signature != 0x00004550)
+        return false;
+
+    if (!Script::Memory::Read(base + pe_offset + 8, &timestamp, sizeof(timestamp), nullptr))
+        return false;
+    if (!Script::Memory::Read(
+            base + pe_offset + 24 + 56,
+            &size_of_image,
+            sizeof(size_of_image),
+            nullptr))
+        return false;
+    return size_of_image != 0;
+}
+
+
 static std::string bytes_to_hex(const uint8_t* data, size_t len) {
     std::string result;
     result.reserve(len * 2);
@@ -759,13 +788,27 @@ static void register_handlers() {
         j.begin_object().key("modules").begin_array();
         for (int i = 0; i < list.count; i++) {
             Script::Module::ModuleInfo* mi = &((Script::Module::ModuleInfo*)list.data)[i];
+            uint32_t pe_timestamp = 0;
+            uint32_t pe_size_of_image = 0;
+            bool have_build_identity = read_pe_build_identity(
+                (uint64_t)mi->base, pe_timestamp, pe_size_of_image);
+
             j.begin_object()
              .key("base").val(hex64(mi->base))
              .key("size").val((uint64_t)mi->size)
              .key("entry").val(hex64(mi->entry))
              .key("name").val(mi->name)
-             .key("path").val(mi->path)
-             .end_object();
+             .key("path").val(mi->path);
+            if (have_build_identity) {
+                char build_id[48] = {};
+                snprintf(
+                    build_id, sizeof(build_id), "pe:%08X:%X",
+                    pe_timestamp, pe_size_of_image);
+                j.key("timestamp").val((uint64_t)pe_timestamp)
+                 .key("size_of_image").val((uint64_t)pe_size_of_image)
+                 .key("build_id").val(build_id);
+            }
+            j.end_object();
         }
         j.end_array().end_object();
         BridgeFree(list.data);

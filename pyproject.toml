@@ -34,6 +34,7 @@ py-modules = [
     "ida_mcp",
     "ida_server_plugin",
     "mco_orchestrator",
+    "mco_identity",
     "mco_sessions",
     "mco_gateway",
 ]

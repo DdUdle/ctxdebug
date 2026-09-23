@@ -26,6 +26,7 @@ from typing import Any
 
 from agent.bridge import X64DbgBridge
 from ida_mcp import IDAClient
+from mco_identity import AddressIdentity, compare_identity_to_ida, parse_windbg_lmv_build
 from windbg_mcp import CdbSession
 from mco_common import serve_stdio, text_error, text_result
 
@@ -143,22 +144,54 @@ class MCOOrchestrator:
         return bool(self._run_async(self._ensure_x64()))
 
     def _ida_available(self) -> bool:
-        """Use the standalone IDA client's health contract."""
-        return bool(self.ida.ping())
+        """Use the shared IDA health contract; tolerate injected test doubles."""
+        ping = getattr(self.ida, "ping", None)
+        if callable(ping):
+            return bool(ping())
+        return bool(getattr(self.ida, "available", False))
 
     def _cdb_connected(self) -> bool:
-        return bool(self.cdb.is_running())
+        is_running = getattr(self.cdb, "is_running", None)
+        if callable(is_running):
+            return bool(is_running())
+        return bool(getattr(self.cdb, "connected", False))
 
     def _cdb_path(self) -> str:
-        return self.cdb.cdb_path
+        return getattr(self.cdb, "cdb_path", getattr(self.cdb, "DEFAULT_CDB", "cdb.exe"))
 
     def _cdb_available(self) -> bool:
         path = self._cdb_path()
         return os.path.isfile(path) or shutil.which(path) is not None
 
     def _close_cdb(self) -> None:
-        if self._cdb_connected():
-            self.cdb.stop()
+        stop = getattr(self.cdb, "stop", None)
+        if callable(stop):
+            if self._cdb_connected():
+                stop()
+            return
+        close = getattr(self.cdb, "close", None)
+        if callable(close):
+            close()
+
+    def _ida_identity_verification(self, identity: AddressIdentity) -> dict:
+        get_info = getattr(self.ida, "get_info", None)
+        if not callable(get_info):
+            return {
+                "enforced": False,
+                "compatible": True,
+                "build_verified": False,
+                "reason": "ida_client_has_no_identity_api",
+            }
+        try:
+            verification = compare_identity_to_ida(identity, get_info())
+        except Exception as exc:
+            return {
+                "enforced": True,
+                "compatible": False,
+                "build_verified": False,
+                "reason": f"ida_identity_query_failed: {exc}",
+            }
+        return {"enforced": True, **verification}
 
     def _x64_bossix_snapshot(self) -> dict:
         async def collect():
@@ -259,6 +292,13 @@ class MCOOrchestrator:
         runtime_base = None
         runtime_module = None
         rva = None
+        build = {
+            "pe_timestamp": None,
+            "pe_size_of_image": None,
+            "image_name": None,
+            "image_path": None,
+            "build_id": None,
+        }
         if crash_addr:
             lm_out = self.cdb.run(f"lm a {crash_addr:#x}", timeout=10)
             result["stages"].append({"stage": "windbg_module_lookup", "output": lm_out[-1500:]})
@@ -267,6 +307,27 @@ class MCOOrchestrator:
                 runtime_base = module_info["base"]
                 runtime_module = module_info["name"]
                 rva = _runtime_to_rva(crash_addr, runtime_base)
+            try:
+                lmv_out = self.cdb.run(f"lmv a {crash_addr:#x}", timeout=10)
+                result["stages"].append(
+                    {"stage": "windbg_build_identity", "output": lmv_out[-1800:]}
+                )
+                build = parse_windbg_lmv_build(lmv_out)
+                runtime_module = build.get("image_name") or runtime_module
+            except Exception as exc:
+                result["stages"].append(
+                    {"stage": "windbg_build_identity", "status": "unavailable", "error": str(exc)}
+                )
+
+        identity = AddressIdentity(
+            address=crash_addr or 0,
+            source="windbg",
+            module=runtime_module,
+            runtime_base=runtime_base,
+            rva=rva,
+            pe_timestamp=build.get("pe_timestamp"),
+            pe_size_of_image=build.get("pe_size_of_image"),
+        ) if crash_addr is not None else None
 
         result["address_normalization"] = {
             "runtime_address": hex(crash_addr) if crash_addr is not None else None,
@@ -274,6 +335,28 @@ class MCOOrchestrator:
             "runtime_module": runtime_module,
             "rva": hex(rva) if rva is not None else None,
         }
+        result["address_identity"] = identity.as_dict() if identity else None
+
+        verification = (
+            self._ida_identity_verification(identity)
+            if identity is not None and rva is not None and self._ida_available()
+            else None
+        )
+        if verification is not None:
+            result["ida_identity_verification"] = verification
+            if verification.get("enforced") and (
+                not verification.get("compatible") or not verification.get("build_verified")
+            ):
+                result["error"] = (
+                    "ida_image_identity_mismatch"
+                    if not verification.get("compatible")
+                    else "runtime_image_identity_unverified"
+                )
+                result["stages"].append(
+                    {"stage": "ida_decompile", "status": result["error"]}
+                )
+                self._close_cdb()
+                return result
 
         # Stage 2: IDA decompile using IDA imagebase + runtime RVA.
         if rva is not None and self._ida_available():
@@ -416,6 +499,11 @@ print(json.dumps({'bossix_hits': hits, 'total': len(hits)}))
         address: str,
         context: str = "",
         runtime_module_base: str = "",
+        runtime_module: str = "",
+        runtime_pe_timestamp: str = "",
+        runtime_pe_size_of_image: str = "",
+        runtime_image_hash: str = "",
+        allow_unverified_image: bool = False,
     ) -> dict:
         """
         Normalize a runtime address through RVA before analyzing it in IDA.
@@ -434,7 +522,8 @@ print(json.dumps({'bossix_hits': hits, 'total': len(hits)}))
             return {"error": "IDA Pro not available"}
 
         runtime_base = None
-        module_name = None
+        module_name = runtime_module or None
+        runtime_module_record = None
         normalization_source = None
 
         if runtime_module_base:
@@ -448,11 +537,54 @@ print(json.dumps({'bossix_hits': hits, 'total': len(hits)}))
             if "error" not in x64_snapshot:
                 module = _find_runtime_module(x64_snapshot.get("modules", []), addr_int)
                 if module:
+                    runtime_module_record = module
                     runtime_base = module["_base_int"]
                     module_name = module.get("name")
                     normalization_source = "x64dbg_modules"
 
         rva = _runtime_to_rva(addr_int, runtime_base) if runtime_base is not None else None
+
+        def _optional_int(value: str) -> int | None:
+            if not value:
+                return None
+            try:
+                return int(value, 0)
+            except ValueError:
+                return int(value, 16)
+
+        if runtime_module_record is not None:
+            identity = AddressIdentity.from_runtime_module(
+                addr_int, runtime_module_record, normalization_source or "x64dbg_modules"
+            )
+        else:
+            identity = AddressIdentity(
+                address=addr_int,
+                source=normalization_source or "already_mapped_ida_address",
+                module=module_name,
+                runtime_base=runtime_base,
+                rva=rva,
+                pe_timestamp=_optional_int(runtime_pe_timestamp),
+                pe_size_of_image=_optional_int(runtime_pe_size_of_image),
+                image_hash=runtime_image_hash or None,
+            )
+
+        verification = None
+        if rva is not None:
+            verification = self._ida_identity_verification(identity)
+            if verification.get("enforced") and not allow_unverified_image:
+                if not verification.get("compatible"):
+                    return {
+                        "error": "ida_image_identity_mismatch",
+                        "address_identity": identity.as_dict(),
+                        "ida_identity_verification": verification,
+                    }
+                if not verification.get("build_verified"):
+                    return {
+                        "error": "runtime_image_identity_unverified",
+                        "address_identity": identity.as_dict(),
+                        "ida_identity_verification": verification,
+                        "hint": "Provide runtime PE timestamp/SizeOfImage/hash or set allow_unverified_image=true explicitly.",
+                    }
         rva_literal = "None" if rva is None else str(rva)
         module_literal = repr(module_name)
 
@@ -536,6 +668,9 @@ else:
             "runtime_module": module_name,
             "source": normalization_source or "already_mapped_ida_address",
         }
+        parsed["address_identity"] = identity.as_dict()
+        if verification is not None:
+            parsed["ida_identity_verification"] = verification
         if context:
             parsed["context_from_windbg"] = context[:500]
 
@@ -805,6 +940,27 @@ class MCPServer:
                         "runtime_module_base": {
                             "type": "string",
                             "description": "Optional runtime module base for ASLR-safe RVA normalization, e.g. '0x7FF712000000'"
+                        },
+                        "runtime_module": {
+                            "type": "string",
+                            "description": "Optional runtime module name/path used for identity verification."
+                        },
+                        "runtime_pe_timestamp": {
+                            "type": "string",
+                            "description": "Optional PE TimeDateStamp (hex or decimal)."
+                        },
+                        "runtime_pe_size_of_image": {
+                            "type": "string",
+                            "description": "Optional PE SizeOfImage (hex or decimal)."
+                        },
+                        "runtime_image_hash": {
+                            "type": "string",
+                            "description": "Optional runtime image hash (MD5 when comparing with IDA input_md5)."
+                        },
+                        "allow_unverified_image": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Explicitly allow a runtime RVA pivot when build identity cannot be verified."
                         }
                     },
                     "required": ["address"]
@@ -903,6 +1059,11 @@ class MCPServer:
                         args["address"],
                         args.get("context", ""),
                         args.get("runtime_module_base", ""),
+                        args.get("runtime_module", ""),
+                        args.get("runtime_pe_timestamp", ""),
+                        args.get("runtime_pe_size_of_image", ""),
+                        args.get("runtime_image_hash", ""),
+                        bool(args.get("allow_unverified_image", False)),
                     ))
                 elif tool == "mco_w_audit":
                     result = self._ok(self.orchestrator.quick_w_audit())
