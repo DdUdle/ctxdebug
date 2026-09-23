@@ -292,7 +292,8 @@ def test_crash_to_source_passes_rva_to_ida(tmp_path):
             pass
 
     class FakeIda:
-        available = True
+        def ping(self):
+            return True
 
         def exec_python(self, code):
             assert f"runtime_address = {runtime}" in code
@@ -346,7 +347,8 @@ def test_pivot_to_ida_uses_explicit_runtime_base_for_aslr():
     expected_rva = 0x123456
 
     class FakeIda:
-        available = True
+        def ping(self):
+            return True
 
         def exec_python(self, code):
             assert f"input_addr = {runtime}" in code
@@ -392,7 +394,8 @@ def test_pivot_to_ida_resolves_x64dbg_module_before_applying_rva():
     calls = []
 
     class FakeIda:
-        available = True
+        def ping(self):
+            return True
 
         def exec_python(self, code):
             assert f"input_addr = {runtime}" in code
@@ -548,7 +551,8 @@ def test_orchestrator_p0_workflows_call_shared_bridge_high_level_api():
     calls = []
 
     class FakeIda:
-        available = False
+        def ping(self):
+            return False
 
     class FakeBridge:
         pipe_name = r"\\.\pipe\test_x64dbg"
