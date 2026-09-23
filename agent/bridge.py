@@ -11,6 +11,8 @@ Key improvements over existing MCP bridges:
 """
 
 import asyncio
+import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -191,38 +193,75 @@ class X64DbgBridge:
             self.state = ConnectionState.DISCONNECTED
             return False
 
+    def _auth_proof(self, role: str, server_nonce: str, client_nonce: str) -> str:
+        message = f"{role}:{server_nonce}:{client_nonce}".encode("ascii")
+        return hmac.new(
+            self.auth_token.encode("utf-8"),
+            message,
+            hashlib.sha256,
+        ).hexdigest()
+
+    async def _read_pipe_message(self, timeout: float = 3.0) -> PipeMessage:
+        header_bytes = await asyncio.wait_for(
+            self._pipe_reader.readexactly(PipeMessage.HEADER_SIZE),
+            timeout=timeout,
+        )
+        header = PipeHeader.unpack(header_bytes)
+        payload = await asyncio.wait_for(
+            self._pipe_reader.readexactly(header.payload_len),
+            timeout=timeout,
+        )
+        return PipeMessage.unpack(header_bytes + payload)
+
     async def _authenticate_pipe(self) -> bool:
-        """Authenticate before marking a named-pipe connection as connected."""
+        """Mutually authenticate without sending the capability token itself."""
         if not self.auth_token or not self._pipe_reader or not self._pipe_writer:
             return False
 
+        try:
+            challenge = await self._read_pipe_message()
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError):
+            return False
+
+        server_nonce = challenge.payload.get("auth_challenge", "")
+        if (
+            challenge.msg_type != MsgType.EVENT
+            or not isinstance(server_nonce, str)
+            or len(server_nonce) < 32
+        ):
+            return False
+
+        client_nonce = secrets.token_hex(32)
         seq = self._next_seq()
         hello = PipeMessage(
             msg_type=MsgType.HEARTBEAT,
             seq_id=seq,
-            payload={"auth": self.auth_token},
+            payload={
+                "nonce": client_nonce,
+                "proof": self._auth_proof("client", server_nonce, client_nonce),
+            },
         )
         self._pipe_writer.write(hello.pack())
         await self._pipe_writer.drain()
 
         try:
-            header_bytes = await asyncio.wait_for(
-                self._pipe_reader.readexactly(PipeMessage.HEADER_SIZE),
-                timeout=3.0,
-            )
-            header = PipeHeader.unpack(header_bytes)
-            payload = await asyncio.wait_for(
-                self._pipe_reader.readexactly(header.payload_len),
-                timeout=3.0,
-            )
-            response = PipeMessage.unpack(header_bytes + payload)
+            response = await self._read_pipe_message()
         except (asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError):
             return False
 
+        expected_server_proof = self._auth_proof(
+            "server",
+            server_nonce,
+            client_nonce,
+        )
         return (
             response.msg_type == MsgType.ACK
             and response.seq_id == seq
             and response.payload.get("authenticated") is True
+            and hmac.compare_digest(
+                response.payload.get("proof", ""),
+                expected_server_proof,
+            )
         )
 
     async def _connect_http(self) -> bool:
@@ -365,6 +404,9 @@ class X64DbgBridge:
         loop = asyncio.get_running_loop()
         args = args or {}
 
+        if self.protocol == BridgeProtocol.NAMED_PIPE and not self.auth_token:
+            return {"error": "X64DBG_PIPE_TOKEN is required for named-pipe IPC"}
+
         if not self.connected:
             if self.protocol == BridgeProtocol.HTTP:
                 # HTTP doesn't need pending futures — direct request/response
@@ -409,7 +451,7 @@ class X64DbgBridge:
         msg = PipeMessage(
             msg_type=MsgType.COMMAND,
             seq_id=seq,
-            payload={"cmd": command, "args": args, "auth": self.auth_token},
+            payload={"cmd": command, "args": args},
         )
         self._pipe_writer.write(msg.pack())
         await self._pipe_writer.drain()
@@ -451,7 +493,7 @@ class X64DbgBridge:
 
                 elif msg.msg_type == MsgType.HEARTBEAT:
                     # Respond with ACK
-                    ack = PipeMessage(MsgType.ACK, msg.seq_id, {"auth": self.auth_token})
+                    ack = PipeMessage(MsgType.ACK, msg.seq_id, {})
                     self._pipe_writer.write(ack.pack())
                     await self._pipe_writer.drain()
 
@@ -472,11 +514,7 @@ class X64DbgBridge:
             while self.connected:
                 await asyncio.sleep(5)
                 if self.protocol == BridgeProtocol.NAMED_PIPE and self._pipe_writer:
-                    msg = PipeMessage(
-                        MsgType.HEARTBEAT,
-                        self._next_seq(),
-                        {"auth": self.auth_token},
-                    )
+                    msg = PipeMessage(MsgType.HEARTBEAT, self._next_seq(), {})
                     try:
                         self._pipe_writer.write(msg.pack())
                         await self._pipe_writer.drain()
