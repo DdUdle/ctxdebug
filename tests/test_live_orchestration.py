@@ -17,9 +17,11 @@ from __future__ import annotations
 import os
 import sys
 
+import json
+
 import pytest
 
-from mco_orchestrator import MCOOrchestrator
+from mco_orchestrator import MCPServer, MCOOrchestrator
 
 
 pytestmark = pytest.mark.skipif(
@@ -28,28 +30,44 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_live_x64dbg_orchestrator_acceptance():
+def test_live_x64dbg_mcp_acceptance():
     if os.environ.get("MCO_LIVE_X64DBG") != "1":
         pytest.skip("set MCO_LIVE_X64DBG=1 to run against a live x64dbg")
 
-    orchestrator = MCOOrchestrator()
+    server = MCPServer()
+
+    def call(name):
+        response = server.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": {}},
+            }
+        )
+        assert response["result"]["isError"] is False
+        return json.loads(response["result"]["content"][0]["text"])
+
     try:
-        status = orchestrator.debugger_status()
+        status = call("mco_status")
         assert status["x64dbg"]["available"] is True
 
-        bossix = orchestrator.bossix_report()
+        bossix = call("mco_bossix_report")
         dynamic = bossix["x64dbg_dynamic"]
         assert "error" not in dynamic
         assert isinstance(dynamic.get("peb"), dict)
-        assert dynamic.get("registers") is not None
+        assert "error" not in dynamic["peb"]
+        assert isinstance(dynamic.get("registers"), dict)
 
-        audit = orchestrator.quick_w_audit()
+        audit = call("mco_w_audit")
         runtime = audit["x64dbg_runtime"]
         assert "error" not in runtime
         assert isinstance(runtime.get("modules"), list)
+        assert runtime["modules"]
         assert isinstance(runtime.get("threads"), list)
+        assert runtime["threads"]
     finally:
-        orchestrator.close()
+        server.orchestrator.close()
 
 
 def test_live_x64dbg_rip_pivots_to_ida_through_rva():
