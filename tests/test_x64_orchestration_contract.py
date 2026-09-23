@@ -15,6 +15,7 @@ from agent.x64_protocol import (
     PIPE_HEADER_STRUCT,
     PIPE_MAGIC,
     PIPE_VERSION,
+    PipeHeader,
     PipeMessage,
 )
 
@@ -43,6 +44,19 @@ def test_response_header_uses_versioned_layout_not_legacy_length_field():
 
     unpacked = PipeMessage.unpack(message)
     assert unpacked.payload == {"ok": True, "value": 123}
+
+    bad_version = bytearray(message)
+    bad_version[4:6] = (PIPE_VERSION + 1).to_bytes(2, "little")
+    with pytest.raises(ValueError, match="Unsupported protocol version"):
+        PipeMessage.unpack(bytes(bad_version))
+
+    with pytest.raises(ValueError, match="Unsupported protocol version"):
+        PipeHeader(
+            msg_type=MsgType.COMMAND,
+            payload_len=0,
+            seq_id=1,
+            version=PIPE_VERSION + 1,
+        ).pack()
 
 
 @pytest.mark.asyncio
