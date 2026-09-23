@@ -177,8 +177,8 @@ def _extract_crash_address(analyze_output: str) -> int | None:
         if "FAULT_IP:" not in line and "ExceptionAddress:" not in line:
             continue
         candidates = line.split()
-        if index + 1 < len(lines):
-            candidates.extend(lines[index + 1].split())
+        for nearby in lines[index + 1:index + 4]:
+            candidates.extend(nearby.split())
         for token in candidates:
             value = _parse_hex_token(token)
             if value is not None and value > 0xFFFF:
