@@ -542,7 +542,7 @@ print(json.dumps({'bossix_hits': hits, 'total': len(hits)}))
 
         code = f"""
 import os
-import idc, idaapi, idautils, json
+import idc, idaapi, idautils, ida_segment, json
 
 input_addr = {addr_int}
 rva = {rva_literal}
@@ -562,7 +562,7 @@ if rva is not None and runtime_stem and ida_stem and runtime_stem != ida_stem:
     }}))
 else:
     addr = ida_imagebase + rva if rva is not None else input_addr
-    segment = idaapi.getseg(addr)
+    segment = ida_segment.getseg(addr)
 
     if segment is None:
         print(json.dumps({{
