@@ -18,15 +18,14 @@ import asyncio
 import json
 import logging
 import os
-import struct
 import subprocess
 import sys
 import time
 import urllib.request
 import urllib.error
-from contextlib import contextmanager
 from typing import Any
 
+from agent.bridge import X64DbgBridge
 from mco_common import serve_stdio, text_error, text_result
 
 logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
@@ -154,34 +153,67 @@ class IDAClient:
             return f"ERROR: {e}"
 
 
-class X64DbgClient:
-    """Minimal x64dbg named-pipe client for orchestrator use."""
+class X64DbgOrchestratorClient:
+    """
+    Synchronous facade over agent.bridge.X64DbgBridge.
 
-    PIPE_NAME = os.environ.get("X64DBG_PIPE", r"\\.\pipe\x64dbg_ai_agent")
-    MAGIC = b"X64A"
-    MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+    MCO is a synchronous stdio MCP server, but x64dbg transport is owned by the
+    async bridge. Keep all wire protocol and command namespace knowledge inside
+    agent.bridge so the orchestrator cannot drift from the plugin again.
+    """
+
+    PIPE_NAME = os.environ.get("X64DBG_PIPE", X64DbgBridge.PIPE_NAME)
+
+    def __init__(self):
+        self.pipe_name = self.PIPE_NAME
+        self._bridge: X64DbgBridge | None = None
 
     def available(self) -> bool:
-        return os.path.exists(self.PIPE_NAME)
+        return bool(self._bridge and self._bridge.connected) or os.path.exists(self.pipe_name)
 
-    def send_command(self, cmd: str, args: dict | None = None) -> dict:
-        if not self.available():
-            return {"error": "x64dbg plugin not running (pipe not found)"}
-        payload = json.dumps({"cmd": cmd, "args": args or {}}).encode()
-        header = self.MAGIC + struct.pack("<I", len(payload)) + b"\x00" * 8
+    async def _bridge_command(self, command: str, args: dict | None = None, timeout: float = 10.0) -> dict:
+        if self._bridge is None:
+            self._bridge = X64DbgBridge(pipe_name=self.pipe_name)
+
+        if not self._bridge.connected:
+            connected = await self._bridge.connect()
+            if not connected:
+                return {"error": "x64dbg plugin not running or bridge unavailable"}
+
+        return await self._bridge.send_command(command, args or {}, timeout=timeout)
+
+    def send_command(self, command: str, args: dict | None = None, timeout: float = 10.0) -> dict:
         try:
-            with open(self.PIPE_NAME, "r+b", buffering=0) as pipe:
-                pipe.write(header + payload)
-                resp_header = pipe.read(16)
-                if len(resp_header) < 16:
-                    return {"error": "Incomplete response header"}
-                resp_len = struct.unpack("<I", resp_header[4:8])[0]
-                if resp_len > self.MAX_RESPONSE_BYTES:
-                    return {"error": f"Response too large: {resp_len} bytes"}
-                resp_data = pipe.read(resp_len)
-                return json.loads(resp_data.decode())
-        except Exception as e:
-            return {"error": str(e)}
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self._bridge_command(command, args, timeout))
+
+        # The current MCP server is synchronous. If this path is hit, calling
+        # asyncio.run() would explode and deadlock-prone thread handoffs would
+        # hide the real integration error.
+        return {"error": "Cannot synchronously call x64dbg while an event loop is already running"}
+
+    def get_registers(self) -> dict:
+        return self.send_command("registers.get_all")
+
+    def get_peb(self) -> dict:
+        return self.send_command("process.peb")
+
+    def get_modules(self) -> dict:
+        return self.send_command("modules.list")
+
+    def get_threads(self) -> dict:
+        return self.send_command("threads.list")
+
+    def close(self) -> None:
+        if not self._bridge:
+            return
+        try:
+            asyncio.run(self._bridge.disconnect())
+        except RuntimeError:
+            pass
+        finally:
+            self._bridge = None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -192,7 +224,7 @@ class MCOOrchestrator:
     def __init__(self):
         self.cdb = CdbClient()
         self.ida = IDAClient()
-        self.x64 = X64DbgClient()
+        self.x64 = X64DbgOrchestratorClient()
 
     # ── Status ───────────────────────────────────────────────
 
@@ -215,7 +247,7 @@ class MCOOrchestrator:
             },
             "x64dbg": {
                 "available": x64_ok,
-                "pipe": self.x64.PIPE_NAME,
+                "pipe": self.x64.pipe_name,
                 "status": "plugin active" if x64_ok else "plugin not loaded"
             },
             "active_count": sum([windbg_ok, ida_ok, x64_ok])
@@ -353,8 +385,8 @@ print(json.dumps({'bossix_hits': hits, 'total': len(hits)}))
 
         # x64dbg PEB check
         if self.x64.available():
-            peb = self.x64.send_command("get_peb")
-            regs = self.x64.send_command("get_registers")
+            peb = self.x64.get_peb()
+            regs = self.x64.get_registers()
             result["x64dbg_dynamic"] = {
                 "peb": peb,
                 "registers": regs,
@@ -503,8 +535,8 @@ print(json.dumps(summary))
             report["ida_audit"] = {"status": "IDA not available"}
 
         if self.x64.available():
-            modules = self.x64.send_command("list_modules")
-            threads = self.x64.send_command("list_threads")
+            modules = self.x64.get_modules()
+            threads = self.x64.get_threads()
             report["x64dbg_runtime"] = {
                 "modules": modules,
                 "threads": threads
