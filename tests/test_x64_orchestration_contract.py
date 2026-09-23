@@ -365,6 +365,70 @@ def test_pivot_to_ida_uses_explicit_runtime_base_for_aslr():
     assert result["ida_address"] == hex(0x140000000 + expected_rva)
 
 
+def test_pivot_to_ida_resolves_x64dbg_module_before_applying_rva():
+    runtime = 0x7FF612123456
+    base = 0x7FF612000000
+    expected_rva = 0x123456
+    calls = []
+
+    class FakeIda:
+        available = True
+
+        def exec_python(self, code):
+            assert f"input_addr = {runtime}" in code
+            assert f"rva = {expected_rva}" in code
+            return json.dumps(
+                {
+                    "input_address": hex(runtime),
+                    "rva": hex(expected_rva),
+                    "ida_imagebase": "0x140000000",
+                    "ida_address": hex(0x140000000 + expected_rva),
+                    "function_name": "crash_here",
+                }
+            )
+
+    class FakeBridge:
+        pipe_name = r"\\.\pipe\test_x64dbg"
+
+        def __init__(self):
+            self.connected = True
+
+        async def connect(self):
+            calls.append("connect")
+            return True
+
+        async def disconnect(self):
+            calls.append("disconnect")
+            self.connected = False
+
+        async def get_modules(self):
+            calls.append("get_modules")
+            return [
+                {
+                    "base": hex(base),
+                    "size": 0x200000,
+                    "name": "sample.exe",
+                }
+            ]
+
+    orchestrator = mco_orchestrator.MCOOrchestrator()
+    orchestrator.x64 = FakeBridge()
+    orchestrator.ida = FakeIda()
+    try:
+        result = orchestrator.pivot_to_ida(hex(runtime))
+    finally:
+        orchestrator.close()
+
+    assert result["address_normalization"] == {
+        "runtime_address": hex(runtime),
+        "runtime_module_base": hex(base),
+        "rva": hex(expected_rva),
+        "runtime_module": "sample.exe",
+        "source": "x64dbg_modules",
+    }
+    assert calls == ["get_modules", "disconnect"]
+
+
 def test_orchestrator_p0_workflows_call_shared_bridge_high_level_api():
     calls = []
 
