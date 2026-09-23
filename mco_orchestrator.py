@@ -262,10 +262,17 @@ class MCOOrchestrator:
         async def collect():
             if not await self._ensure_x64():
                 return {"error": "x64dbg plugin not running"}
-            return {
-                "peb": await self.x64.get_peb(),
-                "registers": await self.x64.get_registers(),
-            }
+
+            peb = await self.x64.get_peb()
+            registers = await self.x64.get_registers()
+            snapshot = {"peb": peb, "registers": registers}
+
+            if isinstance(peb, dict) and peb.get("error"):
+                return {**snapshot, "error": f"process.peb failed: {peb['error']}"}
+            if registers is None:
+                return {**snapshot, "error": "registers.get_all failed"}
+
+            return snapshot
 
         return self._run_async(collect())
 
@@ -281,10 +288,17 @@ class MCOOrchestrator:
         async def collect():
             if not await self._ensure_x64():
                 return {"error": "x64dbg plugin not running"}
-            return {
-                "modules": await self.x64.get_modules(),
-                "threads": await self.x64.get_threads(),
-            }
+
+            modules = await self.x64.get_modules()
+            threads = await self.x64.get_threads()
+            snapshot = {"modules": modules, "threads": threads}
+
+            if not modules:
+                return {**snapshot, "error": "modules.list returned no modules"}
+            if not threads:
+                return {**snapshot, "error": "threads.list returned no threads"}
+
+            return snapshot
 
         return self._run_async(collect())
 
