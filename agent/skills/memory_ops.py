@@ -203,36 +203,36 @@ def register_memory_skills(registry: SkillRegistry):
         SkillDefinition(
             name="read_memory", description="Read memory at address (hex dump)",
             args_schema={"address": "int/hex", "size": "int (default 256)"},
-            category="memory", execute=skill_read_memory,
+            category="memory", effect="read_only", execute=skill_read_memory,
         ),
         SkillDefinition(
             name="write_memory", description="Write hex data to memory",
             args_schema={"address": "int/hex", "data": "hex string"},
-            category="memory", execute=skill_write_memory,
+            category="memory", effect="mutating", execute=skill_write_memory,
         ),
         SkillDefinition(
             name="read_string", description="Read null-terminated string from memory",
             args_schema={"address": "int/hex"},
-            category="memory", execute=skill_read_string,
+            category="memory", effect="read_only", execute=skill_read_string,
         ),
         SkillDefinition(
             name="get_memory_map", description="Get process virtual memory map (flags RWX sections)",
-            category="memory", execute=skill_get_memory_map,
+            category="memory", effect="read_only", execute=skill_get_memory_map,
         ),
         SkillDefinition(
             name="search_pattern", description="Search for byte pattern in memory",
             args_schema={"pattern": "hex pattern with ?? wildcards", "module": "optional module name"},
-            category="memory", execute=skill_search_pattern,
+            category="memory", effect="read_only", execute=skill_search_pattern,
         ),
         SkillDefinition(
             name="search_strings", description="Find readable strings in process memory",
             args_schema={"min_length": "int (default 4)"},
-            category="memory", execute=skill_search_strings,
+            category="memory", effect="read_only", execute=skill_search_strings,
         ),
         SkillDefinition(
             name="allocate_memory", description="Allocate memory in target process",
             args_schema={"size": "int", "protection": "int (default PAGE_READWRITE)"},
-            category="memory", execute=skill_allocate_memory,
+            category="memory", effect="mutating", execute=skill_allocate_memory,
         ),
     ]
     for s in skills:
