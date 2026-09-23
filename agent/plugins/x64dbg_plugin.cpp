@@ -17,6 +17,8 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <bcrypt.h>
+#include <sddl.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -29,6 +31,10 @@
 #include <vector>
 #include <sstream>
 #include <iomanip>
+#include <algorithm>
+
+#pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "advapi32.lib")
 
 #ifndef PAGE_READABLE
 #define PAGE_READABLE (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | \
@@ -83,6 +89,7 @@ enum class MsgType : uint16_t {
 constexpr char PIPE_MAGIC[4] = {'X', '6', '4', 'A'};
 constexpr uint16_t PIPE_VERSION = 1;
 constexpr wchar_t PIPE_NAME[] = L"\\\\.\\pipe\\x64dbg_ai_agent";
+constexpr DWORD PIPE_WORKER_COUNT = 4;
 
 // ============================================================================
 // Minimal JSON builder (no external deps)
@@ -300,8 +307,121 @@ static int json_get_int(const std::string& json, const std::string& key, int def
 // ============================================================================
 static int g_plugin_handle = 0;
 static std::atomic<bool> g_running{false};
-static std::thread g_pipe_thread;
+static std::vector<std::thread> g_pipe_threads;
 static std::mutex g_pipe_mutex;
+static std::mutex g_command_mutex;
+static std::mutex g_clients_mutex;
+static std::vector<HANDLE> g_active_clients;
+static std::string g_auth_token;
+static bool g_auth_token_generated = false;
+
+static bool constant_time_equal(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    unsigned char diff = 0;
+    for (size_t i = 0; i < a.size(); ++i)
+        diff |= static_cast<unsigned char>(a[i] ^ b[i]);
+    return diff == 0;
+}
+
+static bool load_pipe_auth_token() {
+    char configured[512] = {};
+    DWORD length = GetEnvironmentVariableA("X64DBG_PIPE_TOKEN", configured, sizeof(configured));
+    if (length > 0 && length < sizeof(configured)) {
+        g_auth_token.assign(configured, length);
+        g_auth_token_generated = false;
+        if (g_auth_token.size() < 32)
+            return false;
+    } else {
+        uint8_t random_bytes[32] = {};
+        if (BCryptGenRandom(
+                nullptr,
+                random_bytes,
+                static_cast<ULONG>(sizeof(random_bytes)),
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
+            return false;
+
+        static const char hex[] = "0123456789abcdef";
+        g_auth_token.clear();
+        g_auth_token.reserve(sizeof(random_bytes) * 2);
+        for (uint8_t byte : random_bytes) {
+            g_auth_token.push_back(hex[(byte >> 4) & 0xF]);
+            g_auth_token.push_back(hex[byte & 0xF]);
+        }
+        g_auth_token_generated = true;
+    }
+
+    // Do not let a debuggee launched later inherit the controller capability.
+    SetEnvironmentVariableA("X64DBG_PIPE_TOKEN", nullptr);
+    return true;
+}
+
+static bool build_pipe_security(
+    SECURITY_ATTRIBUTES& attributes,
+    PSECURITY_DESCRIPTOR& descriptor
+) {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        return false;
+
+    DWORD required = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &required);
+    if (!required) {
+        CloseHandle(token);
+        return false;
+    }
+
+    std::vector<uint8_t> token_info(required);
+    if (!GetTokenInformation(
+            token,
+            TokenUser,
+            token_info.data(),
+            required,
+            &required)) {
+        CloseHandle(token);
+        return false;
+    }
+    CloseHandle(token);
+
+    TOKEN_USER* token_user = reinterpret_cast<TOKEN_USER*>(token_info.data());
+    LPWSTR sid_text = nullptr;
+    if (!ConvertSidToStringSidW(token_user->User.Sid, &sid_text))
+        return false;
+
+    std::wstring sddl = L"D:P(A;;GA;;;SY)(A;;GA;;;";
+    sddl += sid_text;
+    sddl += L")";
+    LocalFree(sid_text);
+
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.c_str(),
+            SDDL_REVISION_1,
+            &descriptor,
+            nullptr))
+        return false;
+
+    attributes.nLength = sizeof(attributes);
+    attributes.lpSecurityDescriptor = descriptor;
+    attributes.bInheritHandle = FALSE;
+    return true;
+}
+
+static bool get_client_pid(HANDLE pipe, DWORD& client_pid) {
+    using GetNamedPipeClientProcessIdFn = BOOL (WINAPI*)(HANDLE, PULONG);
+    static auto fn = reinterpret_cast<GetNamedPipeClientProcessIdFn>(
+        GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetNamedPipeClientProcessId")
+    );
+    if (!fn) return false;
+
+    ULONG pid = 0;
+    if (!fn(pipe, &pid) || pid == 0)
+        return false;
+    client_pid = static_cast<DWORD>(pid);
+    return true;
+}
+
+static bool payload_authenticated(const std::string& payload) {
+    return constant_time_equal(json_get_string(payload, "auth"), g_auth_token);
+}
 
 // ============================================================================
 // Command Handlers — full x64dbg SDK implementation
@@ -991,6 +1111,20 @@ static bool read_exact(HANDLE pipe, void* buf, DWORD size) {
 }
 
 static void handle_client(HANDLE pipe) {
+    DWORD client_pid = 0;
+    if (!get_client_pid(pipe, client_pid)) {
+        _plugin_logprintf("[MCO] Rejected pipe client: PID lookup failed\n");
+        return;
+    }
+
+    DWORD target_pid = static_cast<DWORD>(DbgGetProcessId());
+    if (target_pid != 0 && client_pid == target_pid) {
+        _plugin_logprintf("[MCO] Rejected pipe client PID %lu: debuggee cannot be controller\n",
+            static_cast<unsigned long>(client_pid));
+        return;
+    }
+
+    bool authenticated = false;
     while (g_running) {
         PipeHeader hdr;
         if (!read_exact(pipe, &hdr, sizeof(hdr))) break;
@@ -1001,14 +1135,35 @@ static void handle_client(HANDLE pipe) {
         std::string payload(hdr.payload_len, '\0');
         if (hdr.payload_len && !read_exact(pipe, payload.data(), hdr.payload_len)) break;
 
+        if (!payload_authenticated(payload)) {
+            send_message(pipe, MsgType::ERROR_MSG, hdr.seq_id, R"({"error":"unauthorized"})");
+            _plugin_logprintf("[MCO] Rejected unauthorized pipe client PID %lu\n",
+                static_cast<unsigned long>(client_pid));
+            break;
+        }
+
+        if (!authenticated) {
+            authenticated = true;
+            _plugin_logprintf("[MCO] Authenticated pipe client PID %lu\n",
+                static_cast<unsigned long>(client_pid));
+        }
+
         auto type = (MsgType)hdr.msg_type;
 
         if (type == MsgType::HEARTBEAT) {
-            send_message(pipe, MsgType::ACK, hdr.seq_id, "");
+            JsonBuilder ack;
+            ack.begin_object()
+               .key("authenticated").val(true)
+               .key("client_pid").val((uint64_t)client_pid)
+               .key("debugger_pid").val((uint64_t)GetCurrentProcessId())
+               .key("target_pid").val((uint64_t)target_pid)
+               .end_object();
+            send_message(pipe, MsgType::ACK, hdr.seq_id, ack.str());
             continue;
         }
 
         if (type == MsgType::COMMAND) {
+            std::lock_guard<std::mutex> command_lock(g_command_mutex);
             std::string cmd = json_get_string(payload, "cmd");
             std::string response;
             auto it = g_handlers.find(cmd);
@@ -1030,23 +1185,86 @@ static void handle_client(HANDLE pipe) {
     }
 }
 
+static void register_active_client(HANDLE pipe) {
+    std::lock_guard<std::mutex> lock(g_clients_mutex);
+    g_active_clients.push_back(pipe);
+}
+
+static void unregister_active_client(HANDLE pipe) {
+    std::lock_guard<std::mutex> lock(g_clients_mutex);
+    auto it = std::find(g_active_clients.begin(), g_active_clients.end(), pipe);
+    if (it != g_active_clients.end())
+        g_active_clients.erase(it);
+}
+
 static void pipe_server_thread() {
+    SECURITY_ATTRIBUTES security_attributes = {};
+    PSECURITY_DESCRIPTOR security_descriptor = nullptr;
+    if (!build_pipe_security(security_attributes, security_descriptor)) {
+        _plugin_logprintf("[MCO] SECURITY ERROR: could not build named-pipe ACL; server not started\n");
+        return;
+    }
+
     while (g_running) {
         HANDLE pipe = CreateNamedPipeW(
             PIPE_NAME,
             PIPE_ACCESS_DUPLEX,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-            PIPE_UNLIMITED_INSTANCES,
-            65536, 65536, 0, nullptr
+            PIPE_WORKER_COUNT,
+            65536, 65536, 0, &security_attributes
         );
         if (pipe == INVALID_HANDLE_VALUE) { Sleep(1000); continue; }
 
         if (ConnectNamedPipe(pipe, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED) {
+            register_active_client(pipe);
             handle_client(pipe);
+            unregister_active_client(pipe);
         }
         DisconnectNamedPipe(pipe);
         CloseHandle(pipe);
     }
+
+    LocalFree(security_descriptor);
+}
+
+static void start_pipe_workers() {
+    g_pipe_threads.clear();
+    g_pipe_threads.reserve(PIPE_WORKER_COUNT);
+    for (DWORD i = 0; i < PIPE_WORKER_COUNT; ++i)
+        g_pipe_threads.emplace_back(pipe_server_thread);
+}
+
+static void stop_pipe_workers() {
+    g_running = false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_clients_mutex);
+        for (HANDLE pipe : g_active_clients) {
+            CancelIoEx(pipe, nullptr);
+            DisconnectNamedPipe(pipe);
+        }
+    }
+
+    // Unblock workers waiting inside ConnectNamedPipe.
+    for (DWORD i = 0; i < PIPE_WORKER_COUNT; ++i) {
+        HANDLE temp = CreateFileW(
+            PIPE_NAME,
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            nullptr,
+            OPEN_EXISTING,
+            0,
+            nullptr
+        );
+        if (temp != INVALID_HANDLE_VALUE)
+            CloseHandle(temp);
+    }
+
+    for (auto& worker : g_pipe_threads) {
+        if (worker.joinable())
+            worker.join();
+    }
+    g_pipe_threads.clear();
 }
 
 // ============================================================================
@@ -1065,10 +1283,19 @@ PLUG_EXPORT bool pluginit(PLUG_INITSTRUCT* init) {
 
     register_handlers();
 
-    // Auto-start pipe server
+    if (!load_pipe_auth_token()) {
+        _plugin_logprintf("[MCO] SECURITY ERROR: X64DBG_PIPE_TOKEN must contain at least 32 characters\n");
+        return false;
+    }
+    if (g_auth_token_generated) {
+        _plugin_logprintf("[MCO] SECURITY: generated ephemeral X64DBG_PIPE_TOKEN=%s\n", g_auth_token.c_str());
+        _plugin_logprintf("[MCO] Configure the same token in ctxdebug before connecting\n");
+    }
+
+    // Auto-start authenticated pipe workers.
     g_running = true;
-    g_pipe_thread = std::thread(pipe_server_thread);
-    _plugin_logprintf("[MCO] AI Agent plugin loaded — named pipe server started\n");
+    start_pipe_workers();
+    _plugin_logprintf("[MCO] AI Agent plugin loaded — authenticated named pipe server started\n");
     _plugin_logprintf("[MCO] Python: python -m agent --mcp\n");
     return true;
 }
@@ -1080,11 +1307,7 @@ PLUG_EXPORT void plugsetup(PLUG_SETUPSTRUCT* setup) {
 }
 
 PLUG_EXPORT bool plugstop() {
-    g_running = false;
-    // Unblock the ConnectNamedPipe call
-    HANDLE temp = CreateFileW(PIPE_NAME, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (temp != INVALID_HANDLE_VALUE) CloseHandle(temp);
-    if (g_pipe_thread.joinable()) g_pipe_thread.join();
+    stop_pipe_workers();
     _plugin_logprintf("[MCO] AI Agent plugin unloaded\n");
     return true;
 }
@@ -1094,8 +1317,8 @@ PLUG_EXPORT void CBMENUENTRY(CBTYPE type, PLUG_CB_MENUENTRY* info) {
         case MENU_START:
             if (!g_running) {
                 g_running = true;
-                g_pipe_thread = std::thread(pipe_server_thread);
-                _plugin_logprintf("[MCO] Agent server started\n");
+                start_pipe_workers();
+                _plugin_logprintf("[MCO] Authenticated agent server started\n");
             } else {
                 _plugin_logprintf("[MCO] Already running\n");
             }
