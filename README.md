@@ -258,6 +258,7 @@ session_export_markdown(session_id=1)
 | `IDA_MCP_PORT` | ida | IDA HTTP port (default: `2022`) |
 | `IDA_MCP_TOKEN` | ida | Bearer token for the IDA HTTP server — required to bind it off loopback |
 | `IDA_SERVER_HOST` | ida | Bind address of the in-IDA HTTP server (default: `127.0.0.1`) |
+| `X64DBG_PIPE_TOKEN` | x64dbg / mco | 256-bit capability token for authenticated x64dbg named-pipe IPC. Gateway generates one automatically for its child processes; standalone/manual x64dbg must share the same token with ctxdebug. |
 | `X64DBG_PATH` | x64dbg | Path to x64dbg.exe |
 | `X64DBG_PIPE` | x64dbg | Named pipe path |
 | `ANTHROPIC_API_KEY` | x64dbg | Only needed with `--llm claude` |
