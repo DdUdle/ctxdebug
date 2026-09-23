@@ -20,6 +20,21 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install test dependencies
-        run: python -m pip install -e ".[dev]"
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pip install -e ".[dev]" 2>&1 | tee install.log
       - name: Run x64dbg orchestration contract tests
-        run: python -m pytest -q tests/test_x64_orchestration_contract.py tests/test_ida_client.py
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q tests/test_x64_orchestration_contract.py tests/test_ida_client.py 2>&1 | tee pytest.log
+      - name: Upload contract logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-logs-${{ matrix.python-version }}
+          path: |
+            install.log
+            pytest.log
+          if-no-files-found: warn
