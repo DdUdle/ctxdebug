@@ -64,10 +64,13 @@ async def test_explicit_http_mode_still_uses_http():
     assert bridge.protocol == BridgeProtocol.HTTP
 
 
-def test_bridge_commands_carry_auth_capability():
+def test_bridge_uses_mutual_hmac_without_sending_raw_token():
     source = inspect.getsource(X64DbgBridge)
-    assert 'payload={"cmd": command, "args": args, "auth": self.auth_token}' in source
-    assert '{"auth": self.auth_token}' in source
+    assert "hmac.new(" in source
+    assert '"auth_challenge"' in source
+    assert '"proof": self._auth_proof("client"' in source
+    assert "expected_server_proof" in source
+    assert 'payload={"cmd": command, "args": args}' in source
     assert 'child_env["X64DBG_PIPE_TOKEN"] = self.auth_token' in source
 
 
@@ -82,9 +85,13 @@ def test_native_pipe_security_contract_is_fail_closed():
     assert "ConvertStringSecurityDescriptorToSecurityDescriptorW" in cpp
     assert "OpenProcessToken" in cpp
     assert "GetNamedPipeClientProcessId" in cpp
-    assert 'json_get_string(payload, "auth")' in cpp
+    assert 'json_get_string(auth_payload, "proof")' in cpp
+    assert 'json_get_string(auth_payload, "nonce")' in cpp
     assert 'SetEnvironmentVariableA("X64DBG_PIPE_TOKEN", nullptr)' in cpp
     assert "BCryptGenRandom" in cpp
+    assert "BCryptCreateHash" in cpp
+    assert "BCRYPT_ALG_HANDLE_HMAC_FLAG" in cpp
+    assert "FILE_FLAG_FIRST_PIPE_INSTANCE" in cpp
     assert "client_pid == target_pid" in cpp
     assert "PIPE_WORKER_COUNT = 4" in cpp
     assert "g_pipe_threads" in cpp
