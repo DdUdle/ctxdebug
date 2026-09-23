@@ -18,7 +18,8 @@
       "env": {
         "IDA_MCP_HOST": "localhost",
         "IDA_MCP_PORT": "2022",
-        "IDA_PATH": "C:\\Program Files\\IDA Professional 9.x"
+        "IDA_PATH": "C:\\Program Files\\IDA Professional 9.x",
+        "IDA_MCP_TOKEN": "replace-with-the-token-shown-in-IDA"
       },
       "description": "IDA Pro 9.x — static analysis, decompile, xrefs, rename, type recovery. 32+ tools."
     },
@@ -54,7 +55,8 @@
         "CDB_PATH": "C:\\Program Files (x86)\\Windows Kits\\10\\Debuggers\\x64\\cdb.exe",
         "IDA_HOST": "localhost",
         "IDA_PORT": "2022",
-        "X64DBG_PIPE": "\\\\.\\pipe\\x64dbg_ai_agent"
+        "X64DBG_PIPE": "\\\\.\\pipe\\x64dbg_ai_agent",
+        "IDA_MCP_TOKEN": "replace-with-the-token-shown-in-IDA"
       },
       "description": "MCO Orchestrator — cross-debugger meta-tools: crash-to-source, pivot_to_ida, malware_audit, heap_spray, binary_diff. 7 compound tools."
     },
