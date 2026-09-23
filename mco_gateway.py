@@ -121,7 +121,7 @@ class SubServer:
             self.started_at = time.time()
             self.failed = False
             self._stdout_q = Queue()
-            self._stderr_tail.clear()
+            self._stderr_tail = deque(maxlen=50)
             self._start_readers()
 
             # MCP handshake: initialize
@@ -159,20 +159,25 @@ class SubServer:
 
     def _start_readers(self) -> None:
         assert self.proc and self.proc.stdout and self.proc.stderr
+        stdout = self.proc.stdout
+        stderr = self.proc.stderr
+        stdout_q = self._stdout_q
+        stderr_tail = self._stderr_tail
+        server_name = self.name
 
         def _stdout_reader():
             try:
-                for line in self.proc.stdout:
-                    self._stdout_q.put(line)
+                for line in stdout:
+                    stdout_q.put(line)
             finally:
-                self._stdout_q.put(None)
+                stdout_q.put(None)
 
         def _stderr_reader():
-            for line in self.proc.stderr:
+            for line in stderr:
                 text = line.rstrip()
                 if text:
-                    self._stderr_tail.append(text)
-                    log.debug("%s stderr: %s", self.name, text)
+                    stderr_tail.append(text)
+                    log.debug("%s stderr: %s", server_name, text)
 
         self._stdout_thread = threading.Thread(
             target=_stdout_reader,
