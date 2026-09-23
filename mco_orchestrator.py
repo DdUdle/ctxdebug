@@ -187,8 +187,8 @@ def _extract_crash_address(analyze_output: str) -> int | None:
     return None
 
 
-def _extract_module_base(lm_output: str, address: int | None = None) -> int | None:
-    """Parse the module start address from WinDbg `lm a <address>` output."""
+def _extract_module_info(lm_output: str, address: int | None = None) -> dict | None:
+    """Parse module bounds/name from WinDbg `lm a <address>` output."""
     for line in lm_output.splitlines():
         parts = line.split()
         if len(parts) < 3:
@@ -197,9 +197,20 @@ def _extract_module_base(lm_output: str, address: int | None = None) -> int | No
         end = _parse_hex_token(parts[1])
         if start is None or end is None or end <= start:
             continue
-        if address is None or start <= address < end:
-            return start
+        if address is not None and not (start <= address < end):
+            continue
+        return {
+            "base": start,
+            "end": end,
+            "name": parts[2],
+        }
     return None
+
+
+def _extract_module_base(lm_output: str, address: int | None = None) -> int | None:
+    """Compatibility helper returning only the WinDbg runtime module base."""
+    info = _extract_module_info(lm_output, address)
+    return info["base"] if info else None
 
 
 def _runtime_to_rva(runtime_address: int, runtime_module_base: int) -> int:
@@ -330,59 +341,80 @@ class MCOOrchestrator:
         result["crash_address"] = hex(crash_addr) if crash_addr else None
 
         runtime_base = None
+        runtime_module = None
         rva = None
         if crash_addr:
             lm_out = self.cdb.run(f"lm a {crash_addr:#x}", timeout=10)
             result["stages"].append({"stage": "windbg_module_lookup", "output": lm_out[-1500:]})
-            runtime_base = _extract_module_base(lm_out, crash_addr)
-            if runtime_base is not None:
+            module_info = _extract_module_info(lm_out, crash_addr)
+            if module_info:
+                runtime_base = module_info["base"]
+                runtime_module = module_info["name"]
                 rva = _runtime_to_rva(crash_addr, runtime_base)
 
         result["address_normalization"] = {
             "runtime_address": hex(crash_addr) if crash_addr is not None else None,
             "runtime_module_base": hex(runtime_base) if runtime_base is not None else None,
+            "runtime_module": runtime_module,
             "rva": hex(rva) if rva is not None else None,
         }
 
         # Stage 2: IDA decompile using IDA imagebase + runtime RVA.
         if rva is not None and self.ida.available:
             ida_code = f"""
+import os
 import idc, idaapi, idautils
 
 runtime_address = {crash_addr}
 runtime_module_base = {runtime_base}
+runtime_module = {json.dumps(runtime_module)}
 rva = {rva}
 ida_imagebase = idaapi.get_imagebase()
-addr = ida_imagebase + rva
-func = idaapi.get_func(addr)
-func_addr = func.start_ea if func else addr
+ida_root = idc.get_root_filename() or ''
+runtime_stem = os.path.splitext(os.path.basename(runtime_module or ''))[0].lower()
+ida_stem = os.path.splitext(os.path.basename(ida_root))[0].lower()
 
-# Decompile
-try:
-    cfunc = idaapi.decompile(func_addr)
-    decompiled = str(cfunc) if cfunc else 'Decompilation failed'
-except Exception as e:
-    decompiled = f'Error: {{e}}'
+if runtime_stem and ida_stem and runtime_stem != ida_stem:
+    print(json.dumps({{
+        'error': 'ida_module_mismatch',
+        'runtime_module': runtime_module,
+        'ida_root_filename': ida_root,
+        'runtime_address': hex(runtime_address),
+        'rva': hex(rva),
+    }}))
+else:
+    addr = ida_imagebase + rva
+    func = idaapi.get_func(addr)
+    func_addr = func.start_ea if func else addr
 
-# Function info
-func_name = idc.get_func_name(func_addr) or 'unknown'
-func_size = (func.end_ea - func.start_ea) if func else 0
+    # Decompile
+    try:
+        cfunc = idaapi.decompile(func_addr)
+        decompiled = str(cfunc) if cfunc else 'Decompilation failed'
+    except Exception as e:
+        decompiled = f'Error: {{e}}'
 
-# Callers
-callers = [hex(r.frm) for r in idautils.XrefsTo(func_addr, 0)][:10]
+    # Function info
+    func_name = idc.get_func_name(func_addr) or 'unknown'
+    func_size = (func.end_ea - func.start_ea) if func else 0
 
-print(json.dumps({{
-    'function': func_name,
-    'runtime_address': hex(runtime_address),
-    'runtime_module_base': hex(runtime_module_base),
-    'rva': hex(rva),
-    'ida_imagebase': hex(ida_imagebase),
-    'ida_address': hex(addr),
-    'function_address': hex(func_addr),
-    'size': func_size,
-    'callers': callers,
-    'decompiled': decompiled[:3000]
-}}))
+    # Callers
+    callers = [hex(r.frm) for r in idautils.XrefsTo(func_addr, 0)][:10]
+
+    print(json.dumps({{
+        'function': func_name,
+        'runtime_address': hex(runtime_address),
+        'runtime_module_base': hex(runtime_module_base),
+        'runtime_module': runtime_module,
+        'ida_root_filename': ida_root,
+        'rva': hex(rva),
+        'ida_imagebase': hex(ida_imagebase),
+        'ida_address': hex(addr),
+        'function_address': hex(func_addr),
+        'size': func_size,
+        'callers': callers,
+        'decompiled': decompiled[:3000]
+    }}))
 """.strip()
             ida_result = self.ida.exec_python(
                 "import json\n" + ida_code
@@ -505,57 +537,74 @@ print(json.dumps({'bossix_hits': hits, 'total': len(hits)}))
 
         rva = _runtime_to_rva(addr_int, runtime_base) if runtime_base is not None else None
         rva_literal = "None" if rva is None else str(rva)
+        module_literal = json.dumps(module_name)
 
         code = f"""
+import os
 import idc, idaapi, idautils, json
 
 input_addr = {addr_int}
 rva = {rva_literal}
+runtime_module = {module_literal}
 ida_imagebase = idaapi.get_imagebase()
-addr = ida_imagebase + rva if rva is not None else input_addr
-segment = idaapi.getseg(addr)
+ida_root = idc.get_root_filename() or ''
+runtime_stem = os.path.splitext(os.path.basename(runtime_module or ''))[0].lower()
+ida_stem = os.path.splitext(os.path.basename(ida_root))[0].lower()
 
-if segment is None:
+if rva is not None and runtime_stem and ida_stem and runtime_stem != ida_stem:
     print(json.dumps({{
-        'error': 'address_not_mapped_in_ida',
+        'error': 'ida_module_mismatch',
+        'runtime_module': runtime_module,
+        'ida_root_filename': ida_root,
         'input_address': hex(input_addr),
-        'rva': hex(rva) if rva is not None else None,
-        'ida_imagebase': hex(ida_imagebase),
-        'candidate_ida_address': hex(addr),
+        'rva': hex(rva),
     }}))
 else:
-    func = idaapi.get_func(addr)
-    func_start = func.start_ea if func else addr
+    addr = ida_imagebase + rva if rva is not None else input_addr
+    segment = idaapi.getseg(addr)
 
-    result = {{
-        'input_address': hex(input_addr),
-        'rva': hex(rva) if rva is not None else None,
-        'ida_imagebase': hex(ida_imagebase),
-        'ida_address': hex(addr),
-        'function_start': hex(func_start),
-        'function_name': idc.get_func_name(func_start) or 'sub_{{:X}}'.format(func_start),
-        'module': idc.get_segm_name(func_start),
-        'flags': idc.get_full_flags(addr),
-    }}
+    if segment is None:
+        print(json.dumps({{
+            'error': 'address_not_mapped_in_ida',
+            'input_address': hex(input_addr),
+            'rva': hex(rva) if rva is not None else None,
+            'ida_imagebase': hex(ida_imagebase),
+            'candidate_ida_address': hex(addr),
+        }}))
+    else:
+        func = idaapi.get_func(addr)
+        func_start = func.start_ea if func else addr
 
-    try:
-        cfunc = idaapi.decompile(func_start)
-        result['pseudocode'] = str(cfunc)[:4000] if cfunc else None
-    except Exception as e:
-        result['pseudocode'] = None
-        result['decompile_error'] = str(e)
+        result = {{
+            'input_address': hex(input_addr),
+            'rva': hex(rva) if rva is not None else None,
+            'ida_imagebase': hex(ida_imagebase),
+            'ida_root_filename': ida_root,
+            'ida_address': hex(addr),
+            'function_start': hex(func_start),
+            'function_name': idc.get_func_name(func_start) or 'sub_{{:X}}'.format(func_start),
+            'module': idc.get_segm_name(func_start),
+            'flags': idc.get_full_flags(addr),
+        }}
 
-    result['xrefs_to'] = [hex(r.frm) for r in idautils.XrefsTo(addr, 0)][:15]
-    result['calls_out'] = []
-    if func:
-        for head in idautils.Heads(func_start, func.end_ea):
-            if idc.is_call_insn(head):
-                target = idc.get_operand_value(head, 0)
-                name = idc.get_func_name(target)
-                if name:
-                    result['calls_out'].append({{'from': hex(head), 'to': name}})
+        try:
+            cfunc = idaapi.decompile(func_start)
+            result['pseudocode'] = str(cfunc)[:4000] if cfunc else None
+        except Exception as e:
+            result['pseudocode'] = None
+            result['decompile_error'] = str(e)
 
-    print(json.dumps(result))
+        result['xrefs_to'] = [hex(r.frm) for r in idautils.XrefsTo(addr, 0)][:15]
+        result['calls_out'] = []
+        if func:
+            for head in idautils.Heads(func_start, func.end_ea):
+                if idc.is_call_insn(head):
+                    target = idc.get_operand_value(head, 0)
+                    name = idc.get_func_name(target)
+                    if name:
+                        result['calls_out'].append({{'from': hex(head), 'to': name}})
+
+        print(json.dumps(result))
 """
         raw = self.ida.exec_python(code)
         try:
