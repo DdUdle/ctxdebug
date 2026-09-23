@@ -20,6 +20,8 @@ from typing import Any, Callable, Optional
 
 from .x64_protocol import (
     MAX_PAYLOAD_BYTES,
+    PIPE_MAGIC,
+    PIPE_VERSION,
     MsgType,
     PipeHeader,
     PipeMessage,
