@@ -11,8 +11,11 @@ Key improvements over existing MCP bridges:
 """
 
 import asyncio
+import hashlib
+import hmac
 import json
 import os
+import secrets
 import time
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -84,12 +87,13 @@ class X64DbgBridge:
 
     def __init__(self, pipe_name: str = None, http_url: str = None,
                  protocol: BridgeProtocol = BridgeProtocol.NAMED_PIPE,
-                 x64dbg_path: str = None):
+                 x64dbg_path: str = None, auth_token: str = None):
         self.pipe_name = pipe_name or self.PIPE_NAME
         self.http_url = http_url or self.HTTP_URL
         self.protocol = protocol
         self._prefer_http = protocol == BridgeProtocol.HTTP
         self.x64dbg_path = x64dbg_path or self.X64DBG_PATH
+        self.auth_token = auth_token if auth_token is not None else os.environ.get("X64DBG_PIPE_TOKEN", "")
         self._x64dbg_proc = None  # launched subprocess handle
         self.state = ConnectionState.DISCONNECTED
         self._seq_counter = 0
@@ -116,14 +120,23 @@ class X64DbgBridge:
     # Connection management
     # ------------------------------------------------------------------
     async def connect(self) -> bool:
-        """Connect to x64dbg. Tries Named Pipe first, falls back to HTTP."""
-        prefer_http = self._prefer_http
-        if not prefer_http:
-            if await self._connect_pipe():
-                self.protocol = BridgeProtocol.NAMED_PIPE
+        """Connect to x64dbg.
+
+        Named-pipe mode is authenticated and does not silently downgrade to the
+        legacy HTTP transport. HTTP is used only when explicitly requested.
+        """
+        if self._prefer_http:
+            if await self._connect_http():
+                self.protocol = BridgeProtocol.HTTP
                 return True
-        if await self._connect_http():
-            self.protocol = BridgeProtocol.HTTP
+            return False
+
+        if not self.auth_token:
+            self.state = ConnectionState.DISCONNECTED
+            return False
+
+        if await self._connect_pipe():
+            self.protocol = BridgeProtocol.NAMED_PIPE
             return True
         return False
 
@@ -158,6 +171,18 @@ class X64DbgBridge:
                     self.state = ConnectionState.DISCONNECTED
                     return False
 
+            if not await self._authenticate_pipe():
+                if self._pipe_writer:
+                    self._pipe_writer.close()
+                    try:
+                        await self._pipe_writer.wait_closed()
+                    except Exception:
+                        pass
+                self._pipe_reader = None
+                self._pipe_writer = None
+                self.state = ConnectionState.DISCONNECTED
+                return False
+
             self.state = ConnectionState.CONNECTED
             self._read_task = asyncio.create_task(self._read_loop())
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
@@ -167,6 +192,77 @@ class X64DbgBridge:
         except Exception:
             self.state = ConnectionState.DISCONNECTED
             return False
+
+    def _auth_proof(self, role: str, server_nonce: str, client_nonce: str) -> str:
+        message = f"{role}:{server_nonce}:{client_nonce}".encode("ascii")
+        return hmac.new(
+            self.auth_token.encode("utf-8"),
+            message,
+            hashlib.sha256,
+        ).hexdigest()
+
+    async def _read_pipe_message(self, timeout: float = 3.0) -> PipeMessage:
+        header_bytes = await asyncio.wait_for(
+            self._pipe_reader.readexactly(PipeMessage.HEADER_SIZE),
+            timeout=timeout,
+        )
+        header = PipeHeader.unpack(header_bytes)
+        payload = await asyncio.wait_for(
+            self._pipe_reader.readexactly(header.payload_len),
+            timeout=timeout,
+        )
+        return PipeMessage.unpack(header_bytes + payload)
+
+    async def _authenticate_pipe(self) -> bool:
+        """Mutually authenticate without sending the capability token itself."""
+        if not self.auth_token or not self._pipe_reader or not self._pipe_writer:
+            return False
+
+        try:
+            challenge = await self._read_pipe_message()
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError):
+            return False
+
+        server_nonce = challenge.payload.get("auth_challenge", "")
+        if (
+            challenge.msg_type != MsgType.EVENT
+            or not isinstance(server_nonce, str)
+            or len(server_nonce) < 32
+        ):
+            return False
+
+        client_nonce = secrets.token_hex(32)
+        seq = self._next_seq()
+        hello = PipeMessage(
+            msg_type=MsgType.HEARTBEAT,
+            seq_id=seq,
+            payload={
+                "nonce": client_nonce,
+                "proof": self._auth_proof("client", server_nonce, client_nonce),
+            },
+        )
+        self._pipe_writer.write(hello.pack())
+        await self._pipe_writer.drain()
+
+        try:
+            response = await self._read_pipe_message()
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError):
+            return False
+
+        expected_server_proof = self._auth_proof(
+            "server",
+            server_nonce,
+            client_nonce,
+        )
+        return (
+            response.msg_type == MsgType.ACK
+            and response.seq_id == seq
+            and response.payload.get("authenticated") is True
+            and hmac.compare_digest(
+                response.payload.get("proof", ""),
+                expected_server_proof,
+            )
+        )
 
     async def _connect_http(self) -> bool:
         """Connect via HTTP (compatibility with existing x64dbg plugins)."""
@@ -263,9 +359,15 @@ class X64DbgBridge:
         if __import__('sys').platform == 'win32':
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
 
+        if not self.auth_token:
+            self.auth_token = secrets.token_hex(32)
+        child_env = os.environ.copy()
+        child_env["X64DBG_PIPE_TOKEN"] = self.auth_token
+
         self._x64dbg_proc = subprocess.Popen(
             cmd,
             creationflags=creationflags,
+            env=child_env,
         )
 
         # Wait for x64dbg to start and the plugin to create the pipe
@@ -301,6 +403,9 @@ class X64DbgBridge:
         """Send a command to x64dbg and wait for response."""
         loop = asyncio.get_running_loop()
         args = args or {}
+
+        if self.protocol == BridgeProtocol.NAMED_PIPE and not self.auth_token:
+            return {"error": "X64DBG_PIPE_TOKEN is required for named-pipe IPC"}
 
         if not self.connected:
             if self.protocol == BridgeProtocol.HTTP:

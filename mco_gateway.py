@@ -18,6 +18,7 @@ Environment:
 
 import json
 import os
+import secrets
 import subprocess
 import sys
 import threading
@@ -33,6 +34,17 @@ logging.basicConfig(
 )
 
 MCO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def _ensure_x64dbg_pipe_token(env=None) -> str:
+    """Give all gateway child processes one high-entropy pipe capability."""
+    target = os.environ if env is None else env
+    token = (target.get("X64DBG_PIPE_TOKEN") or "").strip()
+    if not token:
+        token = secrets.token_hex(32)
+        target["X64DBG_PIPE_TOKEN"] = token
+    return token
+
 
 SERVERS = [
     {
@@ -222,6 +234,7 @@ class SubServer:
 
 class Gateway:
     def __init__(self):
+        self.x64dbg_pipe_token = _ensure_x64dbg_pipe_token()
         enabled = (
             set(os.environ["MCO_SERVERS"].split(","))
             if os.environ.get("MCO_SERVERS")

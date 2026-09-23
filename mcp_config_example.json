@@ -31,7 +31,8 @@
       ],
       "cwd": "C:\\path\\to\\mco",
       "env": {
-        "X64DBG_PATH": "C:\\path\\to\\x64dbg\\x64dbg.exe"
+        "X64DBG_PATH": "C:\\path\\to\\x64dbg\\x64dbg.exe",
+        "X64DBG_PIPE_TOKEN": "replace-with-64-hex-random-token"
       },
       "description": "x64dbg — dynamic analysis, bossix, memory patches, pattern search. 35+ tools."
     },
@@ -54,7 +55,8 @@
         "CDB_PATH": "C:\\Program Files (x86)\\Windows Kits\\10\\Debuggers\\x64\\cdb.exe",
         "IDA_HOST": "localhost",
         "IDA_PORT": "2022",
-        "X64DBG_PIPE": "\\\\.\\pipe\\x64dbg_ai_agent"
+        "X64DBG_PIPE": "\\\\.\\pipe\\x64dbg_ai_agent",
+        "X64DBG_PIPE_TOKEN": "replace-with-64-hex-random-token"
       },
       "description": "MCO Orchestrator — cross-debugger meta-tools: crash-to-source, pivot_to_ida, malware_audit, heap_spray, binary_diff. 7 compound tools."
     },
