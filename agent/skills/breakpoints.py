@@ -225,32 +225,32 @@ def register_breakpoint_skills(registry: SkillRegistry):
         SkillDefinition(
             name="set_breakpoint", description="Set software breakpoint (by address or API name)",
             args_schema={"address": "int/hex", "api": "API name (alternative to address)"},
-            category="breakpoints", execute=skill_set_breakpoint,
+            category="breakpoints", effect="idempotent", execute=skill_set_breakpoint,
         ),
         SkillDefinition(
             name="set_hw_breakpoint", description="Set hardware breakpoint (execute/read/write)",
             args_schema={"address": "int/hex", "condition": "execute/read/write/readwrite", "size": "1/2/4/8"},
-            category="breakpoints", execute=skill_set_hardware_breakpoint,
+            category="breakpoints", effect="mutating", execute=skill_set_hardware_breakpoint,
         ),
         SkillDefinition(
             name="set_mem_breakpoint", description="Set memory breakpoint on address range",
             args_schema={"address": "int/hex", "size": "int", "access_type": "read/write/access"},
-            category="breakpoints", execute=skill_set_memory_breakpoint,
+            category="breakpoints", effect="mutating", execute=skill_set_memory_breakpoint,
         ),
         SkillDefinition(
             name="delete_breakpoint", description="Delete breakpoint at address",
             args_schema={"address": "int/hex"},
-            category="breakpoints", execute=skill_delete_breakpoint,
+            category="breakpoints", effect="idempotent", execute=skill_delete_breakpoint,
         ),
         SkillDefinition(
             name="set_conditional_bp", description="Set breakpoint with condition and optional logging",
             args_schema={"address": "int/hex", "condition": "expression", "log": "log format string"},
-            category="breakpoints", execute=skill_set_conditional_breakpoint,
+            category="breakpoints", effect="mutating", execute=skill_set_conditional_breakpoint,
         ),
         SkillDefinition(
             name="bp_on_api_group", description="Set breakpoints on API group (memory/process/file/network/inject/crypto/bossix)",
             args_schema={"group": "API group name"},
-            category="breakpoints", execute=skill_bp_on_api,
+            category="breakpoints", effect="mutating", execute=skill_bp_on_api,
         ),
     ]
     for s in skills:
