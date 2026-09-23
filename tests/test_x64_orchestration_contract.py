@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 import mco_orchestrator
+from mco_orchestrator import MCPServer
 from agent.bridge import X64DbgBridge
 from agent.x64_protocol import (
     MsgType,
@@ -450,6 +451,60 @@ def test_pivot_to_ida_resolves_x64dbg_module_before_applying_rva():
         "source": "x64dbg_modules",
     }
     assert calls == ["get_modules", "disconnect"]
+
+
+def test_mcp_boundary_exposes_p0_x64dbg_workflows():
+    class FakeOrchestrator:
+        def debugger_status(self):
+            return {
+                "windbg": {"available": False},
+                "ida": {"available": False},
+                "x64dbg": {"available": True, "status": "plugin active"},
+                "active_count": 1,
+            }
+
+        def bossix_report(self):
+            return {
+                "x64dbg_dynamic": {
+                    "peb": {"address": "0x1000", "being_debugged": 0},
+                    "registers": {"rip": 0x401000},
+                }
+            }
+
+        def quick_w_audit(self):
+            return {
+                "x64dbg_runtime": {
+                    "modules": [{"name": "sample.exe"}],
+                    "threads": [{"tid": 1234}],
+                }
+            }
+
+    server = MCPServer()
+    server.orchestrator.close()
+    server.orchestrator = FakeOrchestrator()
+
+    def call(name):
+        response = server.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": {}},
+            }
+        )
+        assert response["result"]["isError"] is False
+        return json.loads(response["result"]["content"][0]["text"])
+
+    status = call("mco_status")
+    assert status["x64dbg"]["available"] is True
+
+    bossix = call("mco_bossix_report")
+    assert bossix["x64dbg_dynamic"]["peb"]["address"] == "0x1000"
+    assert bossix["x64dbg_dynamic"]["registers"]["rip"] == 0x401000
+
+    audit = call("mco_w_audit")
+    assert audit["x64dbg_runtime"]["modules"][0]["name"] == "sample.exe"
+    assert audit["x64dbg_runtime"]["threads"][0]["tid"] == 1234
 
 
 def test_orchestrator_p0_workflows_call_shared_bridge_high_level_api():
