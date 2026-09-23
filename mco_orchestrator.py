@@ -18,7 +18,6 @@ import asyncio
 import json
 import logging
 import os
-import struct
 import subprocess
 import sys
 import time
@@ -27,6 +26,7 @@ import urllib.error
 from contextlib import contextmanager
 from typing import Any
 
+from agent.bridge import X64DbgBridge
 from mco_common import serve_stdio, text_error, text_result
 
 logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
@@ -154,45 +154,104 @@ class IDAClient:
             return f"ERROR: {e}"
 
 
-class X64DbgClient:
-    """Minimal x64dbg named-pipe client for orchestrator use."""
-
-    PIPE_NAME = os.environ.get("X64DBG_PIPE", r"\\.\pipe\x64dbg_ai_agent")
-    MAGIC = b"X64A"
-    MAX_RESPONSE_BYTES = 64 * 1024 * 1024
-
-    def available(self) -> bool:
-        return os.path.exists(self.PIPE_NAME)
-
-    def send_command(self, cmd: str, args: dict | None = None) -> dict:
-        if not self.available():
-            return {"error": "x64dbg plugin not running (pipe not found)"}
-        payload = json.dumps({"cmd": cmd, "args": args or {}}).encode()
-        header = self.MAGIC + struct.pack("<I", len(payload)) + b"\x00" * 8
-        try:
-            with open(self.PIPE_NAME, "r+b", buffering=0) as pipe:
-                pipe.write(header + payload)
-                resp_header = pipe.read(16)
-                if len(resp_header) < 16:
-                    return {"error": "Incomplete response header"}
-                resp_len = struct.unpack("<I", resp_header[4:8])[0]
-                if resp_len > self.MAX_RESPONSE_BYTES:
-                    return {"error": f"Response too large: {resp_len} bytes"}
-                resp_data = pipe.read(resp_len)
-                return json.loads(resp_data.decode())
-        except Exception as e:
-            return {"error": str(e)}
-
-
 # ─────────────────────────────────────────────────────────────
 #  Orchestrator
 # ─────────────────────────────────────────────────────────────
+
+def _parse_hex_token(token: str) -> int | None:
+    cleaned = token.strip().strip(",;:()[]{}").replace("`", "")
+    if cleaned.lower().startswith("0x"):
+        cleaned = cleaned[2:]
+    if not cleaned or any(ch not in "0123456789abcdefABCDEF" for ch in cleaned):
+        return None
+    try:
+        return int(cleaned, 16)
+    except ValueError:
+        return None
+
+
+def _extract_crash_address(analyze_output: str) -> int | None:
+    """Extract the faulting runtime address from common WinDbg !analyze output."""
+    lines = analyze_output.splitlines()
+    for index, line in enumerate(lines):
+        if "FAULT_IP:" not in line and "ExceptionAddress:" not in line:
+            continue
+        candidates = line.split()
+        if index + 1 < len(lines):
+            candidates.extend(lines[index + 1].split())
+        for token in candidates:
+            value = _parse_hex_token(token)
+            if value is not None and value > 0xFFFF:
+                return value
+    return None
+
+
+def _extract_module_base(lm_output: str, address: int | None = None) -> int | None:
+    """Parse the module start address from WinDbg `lm a <address>` output."""
+    for line in lm_output.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        start = _parse_hex_token(parts[0])
+        end = _parse_hex_token(parts[1])
+        if start is None or end is None or end <= start:
+            continue
+        if address is None or start <= address < end:
+            return start
+    return None
+
+
+def _runtime_to_rva(runtime_address: int, runtime_module_base: int) -> int:
+    if runtime_module_base < 0 or runtime_address < runtime_module_base:
+        raise ValueError("Runtime address is below module base")
+    return runtime_address - runtime_module_base
+
 
 class MCOOrchestrator:
     def __init__(self):
         self.cdb = CdbClient()
         self.ida = IDAClient()
-        self.x64 = X64DbgClient()
+        pipe_name = os.environ.get("X64DBG_PIPE") or X64DbgBridge.PIPE_NAME
+        self.x64 = X64DbgBridge(pipe_name=pipe_name)
+        self._async_runner = asyncio.Runner()
+
+    def close(self):
+        try:
+            if self.x64.connected:
+                self._async_runner.run(self.x64.disconnect())
+        finally:
+            self._async_runner.close()
+
+    def _run_async(self, awaitable):
+        return self._async_runner.run(awaitable)
+
+    async def _ensure_x64(self) -> bool:
+        return self.x64.connected or await self.x64.connect()
+
+    def _x64_available(self) -> bool:
+        return bool(self._run_async(self._ensure_x64()))
+
+    def _x64_bossix_snapshot(self) -> dict:
+        async def collect():
+            if not await self._ensure_x64():
+                return {"error": "x64dbg plugin not running"}
+            return {
+                "peb": await self.x64.get_peb(),
+                "registers": await self.x64.get_registers(),
+            }
+
+        return self._run_async(collect())
+
+    def _x64_runtime_snapshot(self) -> dict:
+        async def collect():
+            if not await self._ensure_x64():
+                return {"error": "x64dbg plugin not running"}
+            return {
+                "modules": await self.x64.get_modules(),
+                "threads": await self.x64.get_threads(),
+            }
+
+        return self._run_async(collect())
 
     # ── Status ───────────────────────────────────────────────
 
@@ -200,7 +259,7 @@ class MCOOrchestrator:
         """Check which debuggers are available right now."""
         windbg_ok = os.path.exists(self.cdb.DEFAULT_CDB)
         ida_ok = self.ida.available
-        x64_ok = self.x64.available()
+        x64_ok = self._x64_available()
         return {
             "windbg": {
                 "available": windbg_ok,
@@ -215,7 +274,7 @@ class MCOOrchestrator:
             },
             "x64dbg": {
                 "available": x64_ok,
-                "pipe": self.x64.PIPE_NAME,
+                "pipe": self.x64.pipe_name,
                 "status": "plugin active" if x64_ok else "plugin not loaded"
             },
             "active_count": sum([windbg_ok, ida_ok, x64_ok])
@@ -242,29 +301,35 @@ class MCOOrchestrator:
         analyze = self.cdb.run("!analyze -v", timeout=60)
         result["stages"].append({"stage": "windbg_analyze", "output": analyze[-3000:]})
 
-        # Extract crashing address from !analyze output
-        crash_addr = None
-        for line in analyze.splitlines():
-            if "FAULT_IP:" in line or "ExceptionAddress:" in line:
-                parts = line.split()
-                for p in parts:
-                    if p.startswith("0x") or (len(p) == 16 and all(c in "0123456789abcdefABCDEF" for c in p)):
-                        try:
-                            crash_addr = int(p.replace("0x", ""), 16)
-                            break
-                        except ValueError:
-                            pass
-                if crash_addr:
-                    break
-
+        # Extract runtime fault address, then normalize through RVA before IDA.
+        crash_addr = _extract_crash_address(analyze)
         result["crash_address"] = hex(crash_addr) if crash_addr else None
 
-        # Stage 2: IDA decompile of crashing function
-        if crash_addr and self.ida.available:
+        runtime_base = None
+        rva = None
+        if crash_addr:
+            lm_out = self.cdb.run(f"lm a {crash_addr:#x}", timeout=10)
+            result["stages"].append({"stage": "windbg_module_lookup", "output": lm_out[-1500:]})
+            runtime_base = _extract_module_base(lm_out, crash_addr)
+            if runtime_base is not None:
+                rva = _runtime_to_rva(crash_addr, runtime_base)
+
+        result["address_normalization"] = {
+            "runtime_address": hex(crash_addr) if crash_addr is not None else None,
+            "runtime_module_base": hex(runtime_base) if runtime_base is not None else None,
+            "rva": hex(rva) if rva is not None else None,
+        }
+
+        # Stage 2: IDA decompile using IDA imagebase + runtime RVA.
+        if rva is not None and self.ida.available:
             ida_code = f"""
 import idc, idaapi, idautils
 
-addr = {crash_addr}
+runtime_address = {crash_addr}
+runtime_module_base = {runtime_base}
+rva = {rva}
+ida_imagebase = idaapi.get_imagebase()
+addr = ida_imagebase + rva
 func = idaapi.get_func(addr)
 func_addr = func.start_ea if func else addr
 
@@ -284,7 +349,12 @@ callers = [hex(r.frm) for r in idautils.XrefsTo(func_addr, 0)][:10]
 
 print(json.dumps({{
     'function': func_name,
-    'address': hex(func_addr),
+    'runtime_address': hex(runtime_address),
+    'runtime_module_base': hex(runtime_module_base),
+    'rva': hex(rva),
+    'ida_imagebase': hex(ida_imagebase),
+    'ida_address': hex(addr),
+    'function_address': hex(func_addr),
     'size': func_size,
     'callers': callers,
     'decompiled': decompiled[:3000]
@@ -299,10 +369,13 @@ print(json.dumps({{
                 result["ida_analysis"] = {"raw": ida_result[:2000]}
             result["stages"].append({"stage": "ida_decompile", "status": "ok"})
         else:
-            result["stages"].append({
-                "stage": "ida_decompile",
-                "status": "skipped" if not crash_addr else "ida_not_available"
-            })
+            if not crash_addr:
+                status = "fault_address_unresolved"
+            elif rva is None:
+                status = "runtime_module_base_unresolved"
+            else:
+                status = "ida_not_available"
+            result["stages"].append({"stage": "ida_decompile", "status": status})
 
         self.cdb.close()
         return result
@@ -351,17 +424,15 @@ print(json.dumps({'bossix_hits': hits, 'total': len(hits)}))
         else:
             result["ida_static"] = {"status": "IDA not available"}
 
-        # x64dbg PEB check
-        if self.x64.available():
-            peb = self.x64.send_command("get_peb")
-            regs = self.x64.send_command("get_registers")
+        # x64dbg dynamic snapshot through the shared bridge client.
+        x64_snapshot = self._x64_bossix_snapshot()
+        if "error" not in x64_snapshot:
             result["x64dbg_dynamic"] = {
-                "peb": peb,
-                "registers": regs,
+                **x64_snapshot,
                 "hint": "Use bossix_hide to patch PEB.BeingDebugged"
             }
         else:
-            result["x64dbg_dynamic"] = {"status": "x64dbg not attached"}
+            result["x64dbg_dynamic"] = {"status": "x64dbg not attached", **x64_snapshot}
 
         return result
 
@@ -502,15 +573,11 @@ print(json.dumps(summary))
         else:
             report["ida_audit"] = {"status": "IDA not available"}
 
-        if self.x64.available():
-            modules = self.x64.send_command("list_modules")
-            threads = self.x64.send_command("list_threads")
-            report["x64dbg_runtime"] = {
-                "modules": modules,
-                "threads": threads
-            }
+        x64_snapshot = self._x64_runtime_snapshot()
+        if "error" not in x64_snapshot:
+            report["x64dbg_runtime"] = x64_snapshot
         else:
-            report["x64dbg_runtime"] = {"status": "x64dbg not attached"}
+            report["x64dbg_runtime"] = {"status": "x64dbg not attached", **x64_snapshot}
 
         report["recommendation"] = (
             "HIGH RISK: Multiple suspicious indicators found. Recommend sandbox analysis."
@@ -814,7 +881,10 @@ class MCPServer:
 
 def main():
     server = MCPServer()
-    serve_stdio(server.handle)
+    try:
+        serve_stdio(server.handle)
+    finally:
+        server.orchestrator.close()
 
 
 if __name__ == "__main__":
