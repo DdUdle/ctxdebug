@@ -36,6 +36,8 @@ class PipeHeader:
     version: int = PIPE_VERSION
 
     def pack(self) -> bytes:
+        if self.version != PIPE_VERSION:
+            raise ValueError(f"Unsupported protocol version: {self.version}")
         if self.payload_len < 0 or self.payload_len > MAX_PAYLOAD_BYTES:
             raise ValueError(f"Payload too large: {self.payload_len} bytes")
         return PIPE_HEADER_STRUCT.pack(
