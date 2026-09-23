@@ -173,8 +173,9 @@ def _parse_hex_token(token: str) -> int | None:
 def _extract_crash_address(analyze_output: str) -> int | None:
     """Extract the faulting runtime address from common WinDbg !analyze output."""
     lines = analyze_output.splitlines()
+    markers = ("FAULT_IP:", "FAULTING_IP:", "ExceptionAddress:")
     for index, line in enumerate(lines):
-        if "FAULT_IP:" not in line and "ExceptionAddress:" not in line:
+        if not any(marker in line for marker in markers):
             continue
         candidates = line.split()
         for nearby in lines[index + 1:index + 4]:
