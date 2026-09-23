@@ -21,13 +21,22 @@ import io
 import ipaddress
 import json
 import os
+import secrets
 import sys
 import threading
 import traceback
 
 _IDA_SERVER_PORT = int(os.environ.get("IDA_SERVER_PORT", "2022"))
 _IDA_SERVER_HOST = os.environ.get("IDA_SERVER_HOST", "127.0.0.1")
-_IDA_SERVER_TOKEN = os.environ.get("IDA_MCP_TOKEN", "")
+def _resolve_server_token(configured: str | None = None) -> tuple[str, bool]:
+    """Return (token, generated) with a 256-bit fail-closed default."""
+    value = (configured if configured is not None else os.environ.get("IDA_MCP_TOKEN", "")).strip()
+    if value:
+        return value, False
+    return secrets.token_hex(32), True
+
+
+_IDA_SERVER_TOKEN, _IDA_SERVER_TOKEN_GENERATED = _resolve_server_token()
 _server_instance = None
 _server_thread = None
 _ui_hooks = None
@@ -77,8 +86,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _check_auth(self) -> bool:
-        if not _IDA_SERVER_TOKEN:
-            return True
         provided = self.headers.get("Authorization") or ""
         return hmac.compare_digest(provided, f"Bearer {_IDA_SERVER_TOKEN}")
 
@@ -90,9 +97,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         """Refuse browser-driven and untokenised non-loopback requests."""
         if self.headers.get("Origin") or self.headers.get("Referer"):
             self._send_json({"error": "Forbidden: cross-origin request"}, 403)
-            return True
-        if not _IDA_SERVER_TOKEN and not self._host_is_loopback():
-            self._send_json({"error": "Forbidden: non-loopback Host without IDA_MCP_TOKEN"}, 403)
             return True
         if not self._check_auth():
             self._send_json({"error": "Unauthorized"}, 401)
@@ -366,14 +370,17 @@ def start(port: int | None = None, host: str | None = None):
     bind_port = port or _IDA_SERVER_PORT
     bind_host = host or _IDA_SERVER_HOST
 
-    if not _is_loopback(bind_host) and not _IDA_SERVER_TOKEN:
+    if not _is_loopback(bind_host) and _IDA_SERVER_TOKEN_GENERATED:
         raise RuntimeError(
-            f"[MCO] Refusing to bind {bind_host}: set IDA_MCP_TOKEN before exposing "
-            "the IDAPython exec endpoint off loopback, or bind 127.0.0.1."
+            f"[MCO] Refusing to bind {bind_host} with an auto-generated token. "
+            "Set an explicit IDA_MCP_TOKEN before exposing the IDAPython endpoint off loopback."
         )
-    if not _IDA_SERVER_TOKEN:
-        print("[MCO] WARNING: IDA_MCP_TOKEN is not set — any local process can "
-              "execute IDAPython through this port.")
+
+    if _IDA_SERVER_TOKEN_GENERATED:
+        print("[MCO] SECURITY: generated an ephemeral 256-bit IDA_MCP_TOKEN.")
+        print(f"[MCO] IDA_MCP_TOKEN={_IDA_SERVER_TOKEN}")
+        print("[MCO] Configure the same token for ida_mcp / mco-gateway before connecting.")
+        print("[MCO] The generated token changes when this IDA server restarts.")
 
     try:
         server = _Server((bind_host, bind_port), _Handler)
