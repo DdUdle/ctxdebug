@@ -189,3 +189,58 @@ def test_crash_to_source_passes_rva_to_ida(tmp_path):
         "rva": hex(expected_rva),
     }
     assert result["ida_analysis"]["ida_address"] == hex(0x140000000 + expected_rva)
+
+
+def test_x64_module_lookup_supports_hex_bases():
+    module = mco_orchestrator._find_runtime_module(
+        [
+            {"base": "0x180000000", "size": 0x2000, "name": "other.dll"},
+            {"base": "0x7ff612000000", "size": 0x200000, "name": "sample.exe"},
+        ],
+        0x7FF612123456,
+    )
+    assert module is not None
+    assert module["name"] == "sample.exe"
+    assert module["_base_int"] == 0x7FF612000000
+
+
+def test_pivot_to_ida_uses_explicit_runtime_base_for_aslr():
+    runtime = 0x7FF612123456
+    base = 0x7FF612000000
+    expected_rva = 0x123456
+
+    class FakeIda:
+        available = True
+
+        def exec_python(self, code):
+            assert f"input_addr = {runtime}" in code
+            assert f"rva = {expected_rva}" in code
+            assert "addr = ida_imagebase + rva if rva is not None else input_addr" in code
+            return json.dumps(
+                {
+                    "input_address": hex(runtime),
+                    "rva": hex(expected_rva),
+                    "ida_imagebase": "0x140000000",
+                    "ida_address": hex(0x140000000 + expected_rva),
+                    "function_name": "crash_here",
+                }
+            )
+
+    orchestrator = mco_orchestrator.MCOOrchestrator()
+    orchestrator.ida = FakeIda()
+    try:
+        result = orchestrator.pivot_to_ida(
+            hex(runtime),
+            runtime_module_base=hex(base),
+        )
+    finally:
+        orchestrator.close()
+
+    assert result["address_normalization"] == {
+        "runtime_address": hex(runtime),
+        "runtime_module_base": hex(base),
+        "rva": hex(expected_rva),
+        "runtime_module": None,
+        "source": "explicit_runtime_module_base",
+    }
+    assert result["ida_address"] == hex(0x140000000 + expected_rva)
