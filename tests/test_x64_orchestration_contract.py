@@ -77,6 +77,33 @@ async def test_bridge_high_level_methods_use_plugin_command_namespace():
     ]
 
 
+def test_native_pipe_header_mirrors_python_wire_contract():
+    cpp = (
+        Path(__file__).resolve().parents[1]
+        / "agent"
+        / "plugins"
+        / "x64dbg_plugin.cpp"
+    ).read_text(encoding="utf-8", errors="replace")
+
+    start = cpp.index("struct PipeHeader {")
+    end = cpp.index("#pragma pack(pop)", start)
+    header = cpp[start:end]
+    fields = [
+        "char     magic[4]",
+        "uint16_t version",
+        "uint16_t msg_type",
+        "uint32_t payload_len",
+        "uint32_t seq_id",
+    ]
+    positions = [header.index(field) for field in fields]
+
+    assert positions == sorted(positions)
+    assert 'static_assert(sizeof(PipeHeader) == 16' in cpp
+    assert "constexpr uint16_t PIPE_VERSION = 1;" in cpp
+    assert PIPE_HEADER_SIZE == 16
+    assert PIPE_VERSION == 1
+
+
 def test_plugin_registers_all_orchestrator_p0_handlers():
     cpp = (
         Path(__file__).resolve().parents[1]
