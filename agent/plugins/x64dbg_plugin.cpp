@@ -17,6 +17,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <sddl.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -29,6 +30,11 @@
 #include <vector>
 #include <sstream>
 #include <iomanip>
+#include <cwchar>
+
+#ifndef PIPE_REJECT_REMOTE_CLIENTS
+#define PIPE_REJECT_REMOTE_CLIENTS 0x00000008
+#endif
 
 #ifndef PAGE_READABLE
 #define PAGE_READABLE (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | \
@@ -56,6 +62,7 @@
 
 #pragma comment(lib, "pluginsdk/x64dbg.lib")
 #pragma comment(lib, "pluginsdk/x64bridge.lib")
+#pragma comment(lib, "Advapi32.lib")
 
 // ============================================================================
 // Wire Protocol (must mirror agent/x64_protocol.py exactly)
@@ -83,6 +90,103 @@ enum class MsgType : uint16_t {
 constexpr char PIPE_MAGIC[4] = {'X', '6', '4', 'A'};
 constexpr uint16_t PIPE_VERSION = 1;
 constexpr wchar_t PIPE_NAME[] = L"\\\\.\\pipe\\x64dbg_ai_agent";
+
+static DWORD g_trusted_controller_pid = 0;
+static bool g_allow_untrusted_pipe = false;
+
+static DWORD read_env_pid(const wchar_t* name) {
+    wchar_t buf[32] = {};
+    DWORD n = GetEnvironmentVariableW(name, buf, (DWORD)(sizeof(buf) / sizeof(buf[0])));
+    if (!n || n >= sizeof(buf) / sizeof(buf[0])) return 0;
+    wchar_t* end = nullptr;
+    unsigned long value = std::wcstoul(buf, &end, 10);
+    if (!end || *end != L'\0' || value == 0) return 0;
+    return (DWORD)value;
+}
+
+static bool read_env_flag(const wchar_t* name) {
+    wchar_t buf[8] = {};
+    DWORD n = GetEnvironmentVariableW(name, buf, (DWORD)(sizeof(buf) / sizeof(buf[0])));
+    if (!n || n >= sizeof(buf) / sizeof(buf[0])) return false;
+    return buf[0] == L'1' || buf[0] == L'y' || buf[0] == L'Y' ||
+           buf[0] == L't' || buf[0] == L'T';
+}
+
+static bool build_pipe_security(SECURITY_ATTRIBUTES& sa, PSECURITY_DESCRIPTOR& sd) {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        return false;
+
+    DWORD needed = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &needed);
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || needed == 0) {
+        CloseHandle(token);
+        return false;
+    }
+
+    std::vector<uint8_t> token_buf(needed);
+    if (!GetTokenInformation(token, TokenUser, token_buf.data(), needed, &needed)) {
+        CloseHandle(token);
+        return false;
+    }
+    CloseHandle(token);
+
+    TOKEN_USER* token_user = reinterpret_cast<TOKEN_USER*>(token_buf.data());
+    LPWSTR sid_text = nullptr;
+    if (!ConvertSidToStringSidW(token_user->User.Sid, &sid_text))
+        return false;
+
+    std::wstring sddl = L"D:P(A;;GA;;;";
+    sddl += sid_text;
+    sddl += L")(A;;GA;;;SY)(A;;GA;;;BA)";
+    LocalFree(sid_text);
+
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.c_str(), SDDL_REVISION_1, &sd, nullptr)) {
+        sd = nullptr;
+        return false;
+    }
+
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = sd;
+    sa.bInheritHandle = FALSE;
+    return true;
+}
+
+static bool get_pipe_client_pid(HANDLE pipe, DWORD& client_pid) {
+    using Fn = BOOL (WINAPI*)(HANDLE, PULONG);
+    HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+    if (!kernel) return false;
+    auto fn = reinterpret_cast<Fn>(GetProcAddress(kernel, "GetNamedPipeClientProcessId"));
+    if (!fn) return false;
+    ULONG pid = 0;
+    if (!fn(pipe, &pid) || pid == 0) return false;
+    client_pid = (DWORD)pid;
+    return true;
+}
+
+static bool authorize_pipe_client(HANDLE pipe) {
+    DWORD client_pid = 0;
+    if (!get_pipe_client_pid(pipe, client_pid)) {
+        _plugin_logprintf("[MCO] SECURITY: cannot resolve named-pipe client PID; rejecting.\n");
+        return false;
+    }
+
+    if (g_allow_untrusted_pipe) {
+        _plugin_logprintf(
+            "[MCO] SECURITY WARNING: CTXDEBUG_ALLOW_UNTRUSTED_PIPE is enabled; "
+            "accepting client PID %lu.\n", client_pid);
+        return true;
+    }
+
+    if (!g_trusted_controller_pid || client_pid != g_trusted_controller_pid) {
+        _plugin_logprintf(
+            "[MCO] SECURITY: rejected pipe client PID %lu (expected controller PID %lu).\n",
+            client_pid, g_trusted_controller_pid);
+        return false;
+    }
+    return true;
+}
 
 // ============================================================================
 // Minimal JSON builder (no external deps)
@@ -1031,22 +1135,32 @@ static void handle_client(HANDLE pipe) {
 }
 
 static void pipe_server_thread() {
+    SECURITY_ATTRIBUTES sa = {};
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!build_pipe_security(sa, sd)) {
+        _plugin_logprintf("[MCO] SECURITY: failed to build named-pipe ACL; server disabled.\n");
+        return;
+    }
+
     while (g_running) {
         HANDLE pipe = CreateNamedPipeW(
             PIPE_NAME,
             PIPE_ACCESS_DUPLEX,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-            PIPE_UNLIMITED_INSTANCES,
-            65536, 65536, 0, nullptr
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            1,
+            65536, 65536, 0, &sa
         );
         if (pipe == INVALID_HANDLE_VALUE) { Sleep(1000); continue; }
 
         if (ConnectNamedPipe(pipe, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED) {
-            handle_client(pipe);
+            if (authorize_pipe_client(pipe))
+                handle_client(pipe);
         }
         DisconnectNamedPipe(pipe);
         CloseHandle(pipe);
     }
+
+    LocalFree(sd);
 }
 
 // ============================================================================
@@ -1064,6 +1178,18 @@ PLUG_EXPORT bool pluginit(PLUG_INITSTRUCT* init) {
     g_plugin_handle = init->pluginHandle;
 
     register_handlers();
+
+    g_trusted_controller_pid = read_env_pid(L"CTXDEBUG_CONTROLLER_PID");
+    g_allow_untrusted_pipe = read_env_flag(L"CTXDEBUG_ALLOW_UNTRUSTED_PIPE");
+    if (!g_trusted_controller_pid && !g_allow_untrusted_pipe) {
+        _plugin_logprintf(
+            "[MCO] SECURITY: no trusted controller PID. Launch x64dbg through ctxdebug; "
+            "pipe clients will be rejected. Set CTXDEBUG_ALLOW_UNTRUSTED_PIPE=1 only "
+            "for explicit legacy/insecure mode.\n");
+    } else if (g_trusted_controller_pid) {
+        _plugin_logprintf("[MCO] SECURITY: trusted controller PID %lu.\n",
+                          g_trusted_controller_pid);
+    }
 
     // Auto-start pipe server
     g_running = true;

@@ -16,6 +16,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 IDAT = Path(r"C:\Program Files\IDA Professional 9.2\idat.exe")
 NOTEPAD_SRC = Path(r"C:\Windows\System32\notepad.exe")
+TEST_IDA_TOKEN = "ctxdebug-test-token-0123456789abcdef0123456789abcdef"
 
 
 def _port_open(port: int = 2022) -> bool:
@@ -35,7 +36,10 @@ def _get(path: str, timeout: float = 15) -> dict:
     last: Exception | None = None
     while time.time() < deadline:
         try:
-            req = urllib.request.Request("http://127.0.0.1:2022" + path)
+            req = urllib.request.Request(
+                "http://127.0.0.1:2022" + path,
+                headers={"Authorization": f"Bearer {TEST_IDA_TOKEN}"},
+            )
             with urllib.request.urlopen(req, timeout=5) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except Exception as e:
@@ -50,7 +54,10 @@ def _post_py(code: str, timeout: float = 20) -> dict:
     req = urllib.request.Request(
         "http://127.0.0.1:2022/api/v1/py",
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {TEST_IDA_TOKEN}",
+        },
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -91,9 +98,12 @@ def ida_http():
     if plugin_src.exists() and plugin_dst.parent.exists():
         shutil.copy2(plugin_src, plugin_dst)
 
+    child_env = os.environ.copy()
+    child_env["IDA_MCP_TOKEN"] = TEST_IDA_TOKEN
     proc = subprocess.Popen(
         [str(IDAT), "-A", "-c", "-L" + str(log), "-S" + str(script), str(sample)],
         cwd=str(tests),
+        env=child_env,
     )
     try:
         deadline = time.time() + 90
@@ -146,6 +156,7 @@ def test_mcp_status_and_functions(ida_http):
     ida_mcp._CLIENT = None
     os.environ["IDA_MCP_HOST"] = "127.0.0.1"
     os.environ["IDA_MCP_PORT"] = "2022"
+    os.environ["IDA_MCP_TOKEN"] = TEST_IDA_TOKEN
     status = ida_mcp.tool_status()
     assert "NOT CONNECTED" not in status
     funcs = ida_mcp.tool_functions(0, 5)

@@ -21,13 +21,16 @@ import io
 import ipaddress
 import json
 import os
+import secrets
 import sys
 import threading
 import traceback
 
 _IDA_SERVER_PORT = int(os.environ.get("IDA_SERVER_PORT", "2022"))
 _IDA_SERVER_HOST = os.environ.get("IDA_SERVER_HOST", "127.0.0.1")
-_IDA_SERVER_TOKEN = os.environ.get("IDA_MCP_TOKEN", "")
+_IDA_CONFIGURED_TOKEN = os.environ.get("IDA_MCP_TOKEN", "").strip()
+_IDA_SERVER_TOKEN = _IDA_CONFIGURED_TOKEN or secrets.token_urlsafe(32)
+_IDA_SERVER_TOKEN_GENERATED = not bool(_IDA_CONFIGURED_TOKEN)
 _server_instance = None
 _server_thread = None
 _ui_hooks = None
@@ -77,8 +80,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _check_auth(self) -> bool:
-        if not _IDA_SERVER_TOKEN:
-            return True
         provided = self.headers.get("Authorization") or ""
         return hmac.compare_digest(provided, f"Bearer {_IDA_SERVER_TOKEN}")
 
@@ -90,9 +91,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         """Refuse browser-driven and untokenised non-loopback requests."""
         if self.headers.get("Origin") or self.headers.get("Referer"):
             self._send_json({"error": "Forbidden: cross-origin request"}, 403)
-            return True
-        if not _IDA_SERVER_TOKEN and not self._host_is_loopback():
-            self._send_json({"error": "Forbidden: non-loopback Host without IDA_MCP_TOKEN"}, 403)
             return True
         if not self._check_auth():
             self._send_json({"error": "Unauthorized"}, 401)
@@ -366,14 +364,10 @@ def start(port: int | None = None, host: str | None = None):
     bind_port = port or _IDA_SERVER_PORT
     bind_host = host or _IDA_SERVER_HOST
 
-    if not _is_loopback(bind_host) and not _IDA_SERVER_TOKEN:
-        raise RuntimeError(
-            f"[MCO] Refusing to bind {bind_host}: set IDA_MCP_TOKEN before exposing "
-            "the IDAPython exec endpoint off loopback, or bind 127.0.0.1."
-        )
-    if not _IDA_SERVER_TOKEN:
-        print("[MCO] WARNING: IDA_MCP_TOKEN is not set — any local process can "
-              "execute IDAPython through this port.")
+    if _IDA_SERVER_TOKEN_GENERATED:
+        print("[MCO] SECURITY: generated a 256-bit IDA_MCP_TOKEN for this IDA process.")
+        print(f"[MCO] IDA_MCP_TOKEN={_IDA_SERVER_TOKEN}")
+        print("[MCO] Set the same token in ida_mcp / mco before connecting.")
 
     try:
         server = _Server((bind_host, bind_port), _Handler)
