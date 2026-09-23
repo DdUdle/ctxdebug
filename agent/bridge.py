@@ -263,9 +263,15 @@ class X64DbgBridge:
         if __import__('sys').platform == 'win32':
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
 
+        child_env = os.environ.copy()
+        # The native plugin validates the actual named-pipe client PID against
+        # this controller PID. Override any inherited stale value.
+        child_env["CTXDEBUG_CONTROLLER_PID"] = str(os.getpid())
+
         self._x64dbg_proc = subprocess.Popen(
             cmd,
             creationflags=creationflags,
+            env=child_env,
         )
 
         # Wait for x64dbg to start and the plugin to create the pipe

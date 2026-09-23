@@ -20,7 +20,7 @@ Environment variables:
     IDA_MCP_HOST=127.0.0.1   (default: 127.0.0.1)
     IDA_MCP_PORT=2022        (default: 2022)
     IDA_MCP_TIMEOUT=30       (default: 30 seconds)
-    IDA_MCP_TOKEN=           (optional Bearer token)
+    IDA_MCP_TOKEN=...        (required by ctxdebug ida_server_plugin.py)
     IDA_PATH=C:\\Program Files\\IDA Professional 9.2   (IDA install dir)
 """
 
@@ -258,9 +258,32 @@ if hasattr(idc, "retrieve_input_file_md5"):
 proc = idaapi.inf_get_procname() if hasattr(idaapi, "inf_get_procname") else (
     idc.get_inf_attr(idc.INF_PROCNAME) if hasattr(idc, "INF_PROCNAME") else ""
 )
+input_file = idc.get_input_file_path()
+pe_timestamp = None
+pe_size_of_image = None
+try:
+    import struct
+    with open(input_file, "rb") as f:
+        dos = f.read(0x40)
+        if len(dos) >= 0x40 and dos[:2] == b"MZ":
+            pe_off = struct.unpack_from("<I", dos, 0x3C)[0]
+            f.seek(pe_off)
+            pe_header = f.read(0x60)
+            if len(pe_header) >= 0x54 and pe_header[:4] == b"PE\\0\\0":
+                pe_timestamp = struct.unpack_from("<I", pe_header, 8)[0]
+                pe_size_of_image = struct.unpack_from("<I", pe_header, 24 + 56)[0]
+except Exception:
+    pass
 print(json.dumps({
-    "input_file": idc.get_input_file_path(),
+    "input_file": input_file,
     "input_md5": md5,
+    "pe_timestamp": pe_timestamp,
+    "pe_size_of_image": pe_size_of_image,
+    "build_id": (
+        f"pe:{pe_timestamp:08x}:{pe_size_of_image:x}"
+        if pe_timestamp is not None and pe_size_of_image is not None
+        else None
+    ),
     "min_ea": hex(idc.get_inf_attr(idc.INF_MIN_EA)),
     "max_ea": hex(idc.get_inf_attr(idc.INF_MAX_EA)),
     "entry_point": hex(idc.get_inf_attr(idc.INF_START_IP)),

@@ -21,13 +21,17 @@ import io
 import ipaddress
 import json
 import os
+import secrets
+import struct
 import sys
 import threading
 import traceback
 
 _IDA_SERVER_PORT = int(os.environ.get("IDA_SERVER_PORT", "2022"))
 _IDA_SERVER_HOST = os.environ.get("IDA_SERVER_HOST", "127.0.0.1")
-_IDA_SERVER_TOKEN = os.environ.get("IDA_MCP_TOKEN", "")
+_IDA_CONFIGURED_TOKEN = os.environ.get("IDA_MCP_TOKEN", "").strip()
+_IDA_SERVER_TOKEN = _IDA_CONFIGURED_TOKEN or secrets.token_urlsafe(32)
+_IDA_SERVER_TOKEN_GENERATED = not bool(_IDA_CONFIGURED_TOKEN)
 _server_instance = None
 _server_thread = None
 _ui_hooks = None
@@ -56,6 +60,31 @@ def _md5_hex(raw) -> str:
     return text
 
 
+def _read_pe_identity(path: str) -> dict:
+    """Read PE timestamp and SizeOfImage from the original input file."""
+    result = {"pe_timestamp": None, "pe_size_of_image": None, "build_id": None}
+    if not path:
+        return result
+    try:
+        with open(path, "rb") as f:
+            dos = f.read(0x40)
+            if len(dos) < 0x40 or dos[:2] != b"MZ":
+                return result
+            pe_off = struct.unpack_from("<I", dos, 0x3C)[0]
+            f.seek(pe_off)
+            header = f.read(0x60)
+        if len(header) < 0x54 or header[:4] != b"PE\0\0":
+            return result
+        timestamp = struct.unpack_from("<I", header, 8)[0]
+        size_of_image = struct.unpack_from("<I", header, 24 + 56)[0]
+        result["pe_timestamp"] = timestamp
+        result["pe_size_of_image"] = size_of_image
+        result["build_id"] = f"pe:{timestamp:08x}:{size_of_image:x}"
+    except Exception:
+        pass
+    return result
+
+
 def _is_idaq() -> bool:
     try:
         import ida_kernwin
@@ -77,8 +106,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _check_auth(self) -> bool:
-        if not _IDA_SERVER_TOKEN:
-            return True
         provided = self.headers.get("Authorization") or ""
         return hmac.compare_digest(provided, f"Bearer {_IDA_SERVER_TOKEN}")
 
@@ -90,9 +117,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         """Refuse browser-driven and untokenised non-loopback requests."""
         if self.headers.get("Origin") or self.headers.get("Referer"):
             self._send_json({"error": "Forbidden: cross-origin request"}, 403)
-            return True
-        if not _IDA_SERVER_TOKEN and not self._host_is_loopback():
-            self._send_json({"error": "Forbidden: non-loopback Host without IDA_MCP_TOKEN"}, 403)
             return True
         if not self._check_auth():
             self._send_json({"error": "Unauthorized"}, 401)
@@ -244,6 +268,8 @@ def _collect_info() -> dict:
     except Exception:
         image_base = "0x0"
 
+    pe_identity = _read_pe_identity(input_file)
+
     return {
         "server": "MCO ida_server_plugin",
         "input_file": input_file,
@@ -256,6 +282,9 @@ def _collect_info() -> dict:
         "file_type": file_type,
         "is_dll": is_dll,
         "input_md5": md5,
+        "pe_timestamp": pe_identity["pe_timestamp"],
+        "pe_size_of_image": pe_identity["pe_size_of_image"],
+        "build_id": pe_identity["build_id"],
     }
 
 
@@ -366,14 +395,10 @@ def start(port: int | None = None, host: str | None = None):
     bind_port = port or _IDA_SERVER_PORT
     bind_host = host or _IDA_SERVER_HOST
 
-    if not _is_loopback(bind_host) and not _IDA_SERVER_TOKEN:
-        raise RuntimeError(
-            f"[MCO] Refusing to bind {bind_host}: set IDA_MCP_TOKEN before exposing "
-            "the IDAPython exec endpoint off loopback, or bind 127.0.0.1."
-        )
-    if not _IDA_SERVER_TOKEN:
-        print("[MCO] WARNING: IDA_MCP_TOKEN is not set — any local process can "
-              "execute IDAPython through this port.")
+    if _IDA_SERVER_TOKEN_GENERATED:
+        print("[MCO] SECURITY: generated a 256-bit IDA_MCP_TOKEN for this IDA process.")
+        print(f"[MCO] IDA_MCP_TOKEN={_IDA_SERVER_TOKEN}")
+        print("[MCO] Set the same token in ida_mcp / mco before connecting.")
 
     try:
         server = _Server((bind_host, bind_port), _Handler)
