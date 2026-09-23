@@ -20,7 +20,7 @@ Environment variables:
     IDA_MCP_HOST=127.0.0.1   (default: 127.0.0.1)
     IDA_MCP_PORT=2022        (default: 2022)
     IDA_MCP_TIMEOUT=30       (default: 30 seconds)
-    IDA_MCP_TOKEN=           (optional Bearer token)
+    IDA_MCP_TOKEN=           (Bearer token; server requires authentication)
     IDA_PATH=C:\\Program Files\\IDA Professional 9.2   (IDA install dir)
 """
 
