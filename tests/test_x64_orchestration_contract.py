@@ -551,7 +551,8 @@ def test_orchestrator_p0_workflows_call_shared_bridge_high_level_api():
     calls = []
 
     class FakeIda:
-        available = False
+        def ping(self):
+            return False
 
     class FakeBridge:
         pipe_name = r"\\.\pipe\test_x64dbg"
