@@ -25,6 +25,8 @@ import threading
 import time
 import logging
 import atexit
+from collections import deque
+from queue import Empty, Queue
 
 log = logging.getLogger("mco.gateway")
 logging.basicConfig(
@@ -98,6 +100,10 @@ class SubServer:
         self._lock = threading.Lock()
         self.started_at: float | None = None
         self.failed = False
+        self._stdout_q: Queue[str | None] = Queue()
+        self._stderr_tail = deque(maxlen=50)
+        self._stdout_thread: threading.Thread | None = None
+        self._stderr_thread: threading.Thread | None = None
 
     def start(self, timeout: float = 10.0) -> bool:
         env = {**os.environ}
@@ -113,6 +119,10 @@ class SubServer:
                 env=env
             )
             self.started_at = time.time()
+            self.failed = False
+            self._stdout_q = Queue()
+            self._stderr_tail = deque(maxlen=50)
+            self._start_readers()
 
             # MCP handshake: initialize
             init_resp = self._rpc("initialize", {
@@ -133,12 +143,54 @@ class SubServer:
             return True
 
         except Exception as e:
-            log.warning(f"{self.name}: failed to start — {e}")
+            tail = " | ".join(self._stderr_tail)
+            suffix = f" | stderr: {tail}" if tail else ""
+            log.warning(f"{self.name}: failed to start — {e}{suffix}")
             self.failed = True
             if self.proc:
                 self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=1)
+                except Exception:
+                    self.proc.kill()
                 self.proc = None
+            self.tools = []
             return False
+
+    def _start_readers(self) -> None:
+        assert self.proc and self.proc.stdout and self.proc.stderr
+        stdout = self.proc.stdout
+        stderr = self.proc.stderr
+        stdout_q = self._stdout_q
+        stderr_tail = self._stderr_tail
+        server_name = self.name
+
+        def _stdout_reader():
+            try:
+                for line in stdout:
+                    stdout_q.put(line)
+            finally:
+                stdout_q.put(None)
+
+        def _stderr_reader():
+            for line in stderr:
+                text = line.rstrip()
+                if text:
+                    stderr_tail.append(text)
+                    log.debug("%s stderr: %s", server_name, text)
+
+        self._stdout_thread = threading.Thread(
+            target=_stdout_reader,
+            daemon=True,
+            name=f"mco-{self.name}-stdout",
+        )
+        self._stderr_thread = threading.Thread(
+            target=_stderr_reader,
+            daemon=True,
+            name=f"mco-{self.name}-stderr",
+        )
+        self._stdout_thread.start()
+        self._stderr_thread.start()
 
     def _next_id(self) -> int:
         self._id += 1
@@ -150,6 +202,9 @@ class SubServer:
         self.proc.stdin.flush()
 
     def _rpc(self, method: str, params: dict, timeout: float = 30.0) -> dict:
+        if not self.proc or self.proc.poll() is not None or not self.proc.stdin:
+            raise RuntimeError(f"{self.name} server is not running")
+
         req_id = self._next_id()
         msg = json.dumps({
             "jsonrpc": "2.0",
@@ -160,18 +215,31 @@ class SubServer:
         self.proc.stdin.write(msg)
         self.proc.stdin.flush()
 
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            line = self.proc.stdout.readline()
-            if not line:
-                raise RuntimeError(f"{self.name} stdout closed")
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                tail = "\n".join(self._stderr_tail)
+                detail = f"; stderr tail: {tail}" if tail else ""
+                raise TimeoutError(
+                    f"{self.name} RPC timeout ({method}) after {timeout:.1f}s{detail}"
+                )
+            try:
+                line = self._stdout_q.get(timeout=remaining)
+            except Empty:
+                continue
+
+            if line is None:
+                tail = "\n".join(self._stderr_tail)
+                detail = f": {tail}" if tail else ""
+                raise RuntimeError(f"{self.name} stdout closed{detail}")
+
             try:
                 resp = json.loads(line.strip())
             except json.JSONDecodeError:
                 continue
             if resp.get("id") == req_id:
                 return resp
-        raise TimeoutError(f"{self.name} RPC timeout ({method})")
 
     def call_tool(self, tool_name: str, arguments: dict) -> dict:
         if not self.proc or self.proc.poll() is not None:
@@ -215,6 +283,7 @@ class SubServer:
             except Exception:
                 self.proc.kill()
             self.proc = None
+        self.tools = []
 
     @property
     def uptime(self) -> str | None:
@@ -250,15 +319,12 @@ class Gateway:
                 continue
             srv = SubServer(cfg)
             ok = srv.start(timeout=timeout)
-            if ok:
-                for t in srv.tools:
-                    if t["name"] not in self.tool_map:
-                        self.tool_map[t["name"]] = srv
-            elif not cfg.get("optional", True):
+            if not ok and not cfg.get("optional", True):
                 log.error(f"Required server {cfg['name']} failed — gateway degraded")
             # Always track in server list for status/restart commands
             self.servers.append(srv)
 
+        self._rebuild_tool_map()
         atexit.register(self._shutdown)
         total = sum(len(s.tools) for s in self.servers if s.running)
         log.info(
@@ -269,6 +335,16 @@ class Gateway:
     def _shutdown(self):
         for srv in self.servers:
             srv.stop()
+
+    def _rebuild_tool_map(self) -> None:
+        """Rebuild routing from the currently running servers only."""
+        tool_map: dict[str, SubServer] = {}
+        for srv in self.servers:
+            if not srv.running:
+                continue
+            for tool in srv.tools:
+                tool_map.setdefault(tool["name"], srv)
+        self.tool_map = tool_map
 
     # ── Gateway's own built-in tools ─────────────────────────
 
@@ -353,10 +429,7 @@ class Gateway:
                     s.stop()
                     s.failed = False
                     ok = s.start(timeout=15)
-                    if ok:
-                        for t in s.tools:
-                            if t["name"] not in self.tool_map:
-                                self.tool_map[t["name"]] = s
+                    self._rebuild_tool_map()
                     msg = f"{name}: {'restarted OK' if ok else 'failed to restart'}"
                     return {
                         "content": [{"type": "text", "text": msg}],
