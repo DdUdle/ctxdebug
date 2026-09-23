@@ -256,7 +256,7 @@ session_export_markdown(session_id=1)
 | `WINDBG_MCP_CDB` | windbg | Path to cdb.exe |
 | `IDA_MCP_HOST` | ida | IDA HTTP host (default: `localhost`) |
 | `IDA_MCP_PORT` | ida | IDA HTTP port (default: `2022`) |
-| `IDA_MCP_TOKEN` | ida | Bearer token for the IDA HTTP server — required to bind it off loopback |
+| `IDA_MCP_TOKEN` | ida | Bearer token for the IDA HTTP server. Authentication is required even on loopback; if unset in IDA, the plugin generates an ephemeral 256-bit token and prints it in the IDA console. |
 | `IDA_SERVER_HOST` | ida | Bind address of the in-IDA HTTP server (default: `127.0.0.1`) |
 | `X64DBG_PATH` | x64dbg | Path to x64dbg.exe |
 | `X64DBG_PIPE` | x64dbg | Named pipe path |
