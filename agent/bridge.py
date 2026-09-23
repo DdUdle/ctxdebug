@@ -396,6 +396,10 @@ class X64DbgBridge:
                 self._reconnect_task = asyncio.create_task(self.reconnect())
         except asyncio.CancelledError:
             pass
+        except Exception:
+            self.state = ConnectionState.DISCONNECTED
+            if self._reconnect_task is None or self._reconnect_task.done():
+                self._reconnect_task = asyncio.create_task(self.reconnect())
 
     async def _heartbeat_loop(self):
         """Send periodic heartbeats. Triggers reconnect on pipe failure."""
