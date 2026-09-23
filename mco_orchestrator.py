@@ -423,7 +423,8 @@ else:
                 result["ida_analysis"] = json.loads(ida_result.strip().split("\n")[-1])
             except Exception:
                 result["ida_analysis"] = {"raw": ida_result[:2000]}
-            result["stages"].append({"stage": "ida_decompile", "status": "ok"})
+            ida_status = result["ida_analysis"].get("error", "ok")
+            result["stages"].append({"stage": "ida_decompile", "status": ida_status})
         else:
             if not crash_addr:
                 status = "fault_address_unresolved"
