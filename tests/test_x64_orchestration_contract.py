@@ -214,6 +214,21 @@ def test_orchestrator_uses_shared_bridge_not_private_pipe_client():
         orchestrator.close()
 
 
+def test_windbg_module_info_preserves_module_identity():
+    lm_output = """
+start             end                 module name
+00007ff6`12000000 00007ff6`12200000   sample
+"""
+    runtime = 0x00007FF612123456
+    info = mco_orchestrator._extract_module_info(lm_output, runtime)
+
+    assert info == {
+        "base": 0x00007FF612000000,
+        "end": 0x00007FF612200000,
+        "name": "sample",
+    }
+
+
 def test_windbg_runtime_address_normalizes_to_rva():
     lm_output = """
 start             end                 module name
@@ -305,6 +320,7 @@ def test_crash_to_source_passes_rva_to_ida(tmp_path):
     assert result["address_normalization"] == {
         "runtime_address": hex(runtime),
         "runtime_module_base": hex(base),
+        "runtime_module": "sample",
         "rva": hex(expected_rva),
     }
     assert result["ida_analysis"]["ida_address"] == hex(0x140000000 + expected_rva)
@@ -334,6 +350,9 @@ def test_pivot_to_ida_uses_explicit_runtime_base_for_aslr():
         def exec_python(self, code):
             assert f"input_addr = {runtime}" in code
             assert f"rva = {expected_rva}" in code
+            assert "runtime_module = None" in code
+            assert "runtime_module = null" not in code
+            assert "ida_module_mismatch" in code
             assert "addr = ida_imagebase + rva if rva is not None else input_addr" in code
             return json.dumps(
                 {
@@ -377,6 +396,9 @@ def test_pivot_to_ida_resolves_x64dbg_module_before_applying_rva():
         def exec_python(self, code):
             assert f"input_addr = {runtime}" in code
             assert f"rva = {expected_rva}" in code
+            assert "runtime_module = 'sample.exe'" in code
+            assert "ida_module_mismatch" in code
+            assert "idc.get_root_filename()" in code
             return json.dumps(
                 {
                     "input_address": hex(runtime),
