@@ -179,6 +179,79 @@ async def skill_get_xrefs(bridge, context, args):
     )
 
 
+async def skill_find_module(bridge, context, args):
+    """Find a loaded module by name or resolve an address to module + RVA."""
+    query = args.get("query", "").strip()
+    if not query:
+        return SkillResult(success=False, summary="Missing 'query' argument")
+
+    modules = await bridge.get_modules()
+    if not modules:
+        return SkillResult(success=False, summary="Failed to get modules")
+
+    address = parse_address(query, -1)
+    matches = []
+    if address >= 0 and (query.lower().startswith("0x") or query.isdigit()):
+        for module in modules:
+            base = module.get("base", 0)
+            size = module.get("size", 0)
+            if base <= address < base + size:
+                matches.append({
+                    **module,
+                    "address": address,
+                    "rva": address - base,
+                })
+    else:
+        needle = query.casefold()
+        matches = [m for m in modules if needle in str(m.get("name", "")).casefold()
+                   or needle in str(m.get("path", "")).casefold()]
+
+    if not matches:
+        return SkillResult(success=True, data=[], summary=f"No module matches {query!r}")
+
+    lines = []
+    for module in matches:
+        base = module.get("base", 0)
+        size = module.get("size", 0)
+        line = f"{module.get('name', '?')}: base=0x{base:X}, size=0x{size:X}"
+        if "rva" in module:
+            line += f", address=0x{module['address']:X}, RVA=0x{module['rva']:X}"
+        lines.append(line)
+
+    return SkillResult(
+        success=True,
+        data=matches,
+        summary=f"Found {len(matches)} module match(es) for {query!r}",
+        details="\n".join(lines),
+        suggestions=["disassemble", "read_memory", "set_breakpoint"],
+    )
+
+
+async def skill_find_string(bridge, context, args):
+    """Find strings containing a case-insensitive query."""
+    query = args.get("query", "").strip()
+    if not query:
+        return SkillResult(success=False, summary="Missing 'query' argument")
+
+    min_length = parse_int(args.get("min_length"), 4)
+    limit = max(1, min(parse_int(args.get("limit"), 20), 200))
+    strings = await bridge.search_strings(min_length)
+    matches = [s for s in strings if query.casefold() in str(s.get("text", "")).casefold()]
+    matches = matches[:limit]
+
+    lines = [f"Found {len(matches)} string match(es) for {query!r}:"]
+    for item in matches:
+        lines.append(f"  0x{item.get('address', 0):X}: {item.get('text', '')}")
+
+    return SkillResult(
+        success=True,
+        data=matches,
+        summary=f"Found {len(matches)} string match(es) for {query!r}",
+        details="\n".join(lines),
+        suggestions=["read_string", "disassemble", "get_xrefs"],
+    )
+
+
 async def skill_get_modules(bridge, context, args):
     """List loaded modules."""
     modules = await bridge.get_modules()
@@ -321,6 +394,16 @@ def register_analysis_skills(registry: SkillRegistry):
         SkillDefinition(
             name="get_modules", description="List loaded modules with base addresses",
             category="analysis", execute=skill_get_modules,
+        ),
+        SkillDefinition(
+            name="find_module", description="Find a module by name or resolve an address to module + RVA",
+            args_schema={"query": "module name, path fragment, or address", "limit": "optional result limit"},
+            category="analysis", execute=skill_find_module,
+        ),
+        SkillDefinition(
+            name="find_string", description="Find strings containing a case-insensitive query",
+            args_schema={"query": "text fragment", "min_length": "minimum string length", "limit": "maximum matches"},
+            category="analysis", execute=skill_find_string,
         ),
         SkillDefinition(
             name="get_imports", description="Get import table (grouped by DLL)",

@@ -327,6 +327,31 @@ class MCPServer:
                 output_schema=_STANDARD_OUTPUT,
             ),
             _tool(
+                "find_module",
+                "Find a loaded module by name/path fragment, or resolve an address to its module and RVA. "
+                "Useful for quickly mapping an instruction address during RE.",
+                {
+                    "query": {
+                        "type": "string",
+                        "description": "Module name/path fragment or address such as 'kernel32' or '0x7FF700001234'.",
+                    },
+                },
+                required=["query"],
+                output_schema=_STANDARD_OUTPUT,
+            ),
+            _tool(
+                "find_string",
+                "Find readable strings containing a text fragment (case-insensitive), with addresses. "
+                "Useful for locating CTF flags, URLs, error messages, and cross-reference targets.",
+                {
+                    "query": {"type": "string", "description": "Text fragment to search for."},
+                    "min_length": {"type": "integer", "minimum": 3, "maximum": 256, "default": 4},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20},
+                },
+                required=["query"],
+                output_schema=_STANDARD_OUTPUT,
+            ),
+            _tool(
                 "list_imports",
                 "Get import table grouped by DLL. Network imports → C2; crypto imports → ransomware; "
                 "anti-debug imports → evasion.",
@@ -1009,7 +1034,16 @@ class MCPServer:
             return await self._run_skill("get_process_info", {})
         if name == "list_modules":
             return await self._run_skill("get_modules", {})
+        if name == "find_module":
+            return await self._run_skill("find_module", {"query": args.get("query")})
+        if name == "find_string":
+            return await self._run_skill("find_string", {
+                "query": args.get("query"),
+                "min_length": _arg(args, "min_length", 4),
+                "limit": _arg(args, "limit", 20),
+            })
         if name == "list_imports":
+
             return await self._run_skill("get_imports", {"module": args.get("module")})
         if name == "list_exports":
             return await self._run_skill("get_exports", {"module": args.get("module")})
@@ -1251,6 +1285,8 @@ class MCPServer:
         "analyze_function": "analyze_function",
         "get_xrefs": "get_xrefs",
         "get_modules": "list_modules",
+        "find_module": "find_module",
+        "find_string": "find_string",
         "get_imports": "list_imports",
         "get_exports": "list_exports",
         "get_call_stack": "get_call_stack",
