@@ -58,7 +58,7 @@
 #pragma comment(lib, "pluginsdk/x64bridge.lib")
 
 // ============================================================================
-// Wire Protocol (must match bridge.py exactly)
+// Wire Protocol (must mirror agent/x64_protocol.py exactly)
 // ============================================================================
 #pragma pack(push, 1)
 struct PipeHeader {
